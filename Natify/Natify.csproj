@@ -2,6 +2,13 @@
 
     <PropertyGroup>
         <TargetFramework>netstandard2.0</TargetFramework>
+        <LangVersion>9.0</LangVersion>
     </PropertyGroup>
+
+    <ItemGroup>
+      <PackageReference Include="Google.Protobuf" Version="3.34.1" />
+      <PackageReference Include="Microsoft.Bcl.AsyncInterfaces" Version="10.0.6" />
+      <PackageReference Include="NATS.Net" Version="2.7.3" />
+    </ItemGroup>
 
 </Project>
