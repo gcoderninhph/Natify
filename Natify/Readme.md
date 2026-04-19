@@ -1,9 +1,3 @@
-Dự án `Natify` của bạn đã trải qua một cuộc lột xác ngoạn mục, từ một Wrapper NATS cơ bản trở thành một **hệ thống High-Performance Pub/Sub cấp độ công nghiệp**, với khả năng Micro-Batching, đảm bảo giao hàng (Reliability), chống trùng lặp (Deduplication) và giám sát thời gian thực (Telemetry).
-
-Dưới đây là bản cập nhật hoàn chỉnh cho file `Request.md` (hoặc `README.md`) phản ánh chính xác kiến trúc mới nhất của bạn.
-
-***
-
 ### Natify
 
 Đây là một framework giao tiếp High-Performance dành cho kiến trúc Microservice và Game Server (đặc biệt tối ưu cho Unity), được xây dựng trên nền tảng NATS Core.
