@@ -1,0 +1,7 @@
+﻿syntax = "proto3";
+package Natify;
+
+// Gói này dùng để bọc nhiều Payload lại với nhau
+message NatifyBatch {
+  repeated bytes payloads = 1;
+}

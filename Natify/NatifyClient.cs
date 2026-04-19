@@ -1,5 +1,4 @@
 ﻿using System;
-using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -8,8 +7,6 @@ using System.Threading.Channels;
 using System.Threading.Tasks;
 using Google.Protobuf;
 using NATS.Client.Core;
-using NATS.Client.JetStream;
-using NATS.Client.JetStream.Models;
 
 #if UNITY_5_3_OR_NEWER
 using UnityEngine;
@@ -17,19 +14,42 @@ using UnityEngine;
 
 namespace Natify
 {
+    public class UnackedMessage
+    {
+        public string Subject { get; set; }
+        public byte[] Payload { get; set; }
+        public string MessageId { get; set; }
+        public DateTime LastSent { get; set; }
+        public int RetryCount { get; set; }
+    }
+
     public class NatifyClient : IDisposable
     {
+        private readonly ConcurrentDictionary<string, UnackedMessage> _unackedMessages = new();
+        private readonly TimeSpan _ackTimeout = TimeSpan.FromMilliseconds(100);
         private readonly INatsConnection _connection;
-        private readonly INatsJSContext _jsContext;
         private readonly string _clientName;
         private readonly string _groupName;
         private readonly string _regionId;
         private readonly string _serverNameToConnect;
         private bool _isDisposed = false;
+        private readonly int _maxRetries = 10;
+        private Task _batchWorkerTask;
 
-        private readonly Channel<(string Subject, byte[] Data, int Length)> _publishChannel;
+        private readonly ConcurrentDictionary<string, byte> _processedMessages;
+        private readonly TimedSortedSet<string, byte> _messageTtlWheel;
+
+        public NatifyClientTriggers Trigger { get; } = new();
+
+        private const int MaxCount = 1000;
+        private const int MaxSize = 50 * 1024; // 50 KB
+        private readonly TimeSpan MaxWait = TimeSpan.FromMilliseconds(50);
+
+        private readonly Channel<(string Subject, byte[] Payload)> _batchChannel =
+            Channel.CreateUnbounded<(string, byte[])>();
+
         private readonly CancellationTokenSource _cts;
-        private readonly ConcurrentQueue<Action> _mainThreadActions = new ConcurrentQueue<Action>();
+        private readonly ConcurrentQueue<Action> _mainThreadActions = new();
 
         public NatifyClient(string url, string clientName, string groupName, string regionId,
             string serverNameToConnect)
@@ -38,6 +58,10 @@ namespace Natify
             _groupName = groupName;
             _regionId = regionId;
             _serverNameToConnect = serverNameToConnect;
+
+            _processedMessages = new ConcurrentDictionary<string, byte>();
+            _messageTtlWheel = new TimedSortedSet<string, byte>();
+            _messageTtlWheel.OnExpired += OnMessagesExpired;
 
             var opts = new NatsOpts
             {
@@ -49,20 +73,192 @@ namespace Natify
             _connection.ConnectAsync().AsTask().GetAwaiter().GetResult();
 
             _cts = new CancellationTokenSource();
-            _publishChannel = Channel.CreateUnbounded<(string, byte[], int)>();
-            _jsContext = new NatsJSContext(_connection);
 
             // Khởi chạy luồng ngầm an toàn (thay thế cho Thread truyền thống gây cảnh báo)
-            _ = Task.Run(PublishWorkerAsync, _cts.Token);
+            StartReliableFeatures();
+            StartBatchWorker();
+        }
+
+        private void OnMessagesExpired(IReadOnlyList<(string Key, byte Value)> expiredItems)
+        {
+            foreach (var item in expiredItems)
+            {
+                _processedMessages.TryRemove(item.Key, out _);
+            }
+
+            Trigger.RemoveDedupItems(expiredItems.Count);
+        }
+
+        private void StartBatchWorker()
+        {
+            _batchWorkerTask = Task.Run(BatchWorkerAsync);
+        }
+
+        private async Task BatchWorkerAsync()
+        {
+            var reader = _batchChannel.Reader;
+
+            // Vòng lặp chờ tin nhắn ĐẦU TIÊN của một lô mới
+            while (await reader.WaitToReadAsync(_cts.Token))
+            {
+                var batches = new Dictionary<string, NatifyBatch>();
+                int currentCount = 0;
+                int currentSizeBytes = 0;
+
+                // Bắt đầu bấm giờ ngay khi nhận được tin nhắn đầu tiên
+                var batchStartTime = DateTime.UtcNow;
+
+                // Vòng lặp gom hàng
+                while (currentCount < MaxCount && currentSizeBytes < MaxSize)
+                {
+                    // Kiểm tra xem đã hết 50ms chưa
+                    var elapsed = DateTime.UtcNow - batchStartTime;
+                    if (elapsed >= MaxWait)
+                    {
+                        break; // Hết 50ms -> Cắt lô gửi luôn
+                    }
+
+                    // Cố gắng rút tin nhắn ra khỏi Phễu
+                    if (reader.TryRead(out var item))
+                    {
+                        if (!batches.TryGetValue(item.Subject, out var batch))
+                        {
+                            batch = new NatifyBatch();
+                            batches[item.Subject] = batch;
+                        }
+
+                        // Gom vào lô
+                        batch.Payloads.Add(ByteString.CopyFrom(item.Payload));
+
+                        // Cập nhật bộ đếm
+                        currentCount++;
+                        currentSizeBytes += item.Payload.Length;
+                    }
+                    else
+                    {
+                        // Phễu tạm thời hết hàng, ta sẽ chờ thêm tin nhắn mới.
+                        // NHƯNG chỉ chờ tối đa trong khoảng thời gian còn lại của 50ms.
+                        var timeLeft = MaxWait - elapsed;
+
+                        try
+                        {
+                            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+                            timeoutCts.CancelAfter(timeLeft);
+
+                            // Treo luồng chờ tin nhắn mới bay vào, hoặc bị ép thức dậy khi hết timeLeft
+                            await reader.WaitToReadAsync(timeoutCts.Token);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            // Lỗi này xảy ra khi:
+                            // 1. Hết giờ TimeLeft (đã đủ 50ms).
+                            // 2. Hoặc người dùng tắt App (_cts bị Cancel).
+                            // Dù là lý do gì, ta cũng break để xả nốt hàng đang cầm trên tay xuống NATS.
+                            break;
+                        }
+                    }
+                }
+
+                // --- XẢ BATCH (Gửi đi) ---
+                if (currentCount > 0)
+                {
+                    foreach (var kvp in batches)
+                    {
+                        string subject = kvp.Key;
+                        NatifyBatch batchMsg = kvp.Value;
+                        string messageId = Guid.NewGuid().ToString("N");
+
+                        var (buffer, length) = NatifySerializer.Serialize(batchMsg);
+                        var exactData = new byte[length];
+                        Array.Copy(buffer, exactData, length);
+                        System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
+
+                        Trigger.AddSent(length, batchMsg.Payloads.Count);
+                        Trigger.AddBatchSent();
+
+                        var unackedMsg = new UnackedMessage
+                        {
+                            Subject = subject,
+                            Payload = exactData,
+                            MessageId = messageId,
+                            LastSent = DateTime.UtcNow,
+                            RetryCount = 0
+                        };
+
+                        _unackedMessages.TryAdd(messageId, unackedMsg);
+
+                        var headers = new NatsHeaders { ["Natify-MsgId"] = messageId };
+                        await _connection.PublishAsync(subject, exactData, headers: headers,
+                            cancellationToken: _cts.Token);
+                    }
+                }
+            }
+        }
+
+        // Khởi động luồng Retry và lắng nghe ACK trong Constructor
+        private void StartReliableFeatures()
+        {
+            // 1. Lắng nghe ACK từ Server
+            string ackSubject = $"NatifyClient.{_clientName}.{_serverNameToConnect}.{_regionId}.ACK.*";
+            _ = Task.Run(async () =>
+            {
+                await foreach (var msg in _connection.SubscribeAsync<byte[]>(ackSubject, cancellationToken: _cts.Token))
+                {
+                    // Lấy MessageId từ Header hoặc Subject (ở đây lấy từ đuôi Subject cho nhanh)
+                    var parts = msg.Subject.Split('.');
+                    string messageId = parts[^1];
+
+                    // Nhận được ACK -> Xóa khỏi danh sách chờ gửi lại
+                    _unackedMessages.TryRemove(messageId, out _);
+                }
+            });
+
+            // 2. Vòng lặp ngầm kiểm tra và Gửi lại (Retry)
+            _ = Task.Run(async () =>
+            {
+                while (!_cts.IsCancellationRequested)
+                {
+                    var now = DateTime.UtcNow;
+                    foreach (var kvp in _unackedMessages)
+                    {
+                        var unacked = kvp.Value;
+                        if (now - unacked.LastSent > _ackTimeout)
+                        {
+                            if (unacked.RetryCount >= _maxRetries)
+                            {
+                                LogError($"[NatifyClient] Drop gói tin {unacked.MessageId} vì vượt quá số lần Retry.");
+                                _unackedMessages.TryRemove(kvp.Key, out _);
+                                continue;
+                            }
+
+                            // Gửi lại
+                            unacked.LastSent = DateTime.UtcNow;
+                            unacked.RetryCount++;
+
+                            var headers = new NatsHeaders { ["Natify-MsgId"] = unacked.MessageId };
+                            await _connection.PublishAsync(unacked.Subject, unacked.Payload, headers: headers,
+                                cancellationToken: _cts.Token);
+                        }
+                    }
+
+                    await Task.Delay(100, _cts.Token); // Quét mỗi 100ms
+                }
+            });
         }
 
         public void Publish<T>(string topic, T message) where T : IMessage
         {
-            if (_isDisposed) return; // Không cho phép gửi nếu Client đã tắt
+            if (_isDisposed) return;
 
-            var subject = NatifyTopics.GetClientPublishSubject(_serverNameToConnect, _clientName, _regionId, topic);
+            string subject = NatifyTopics.GetClientPublishSubject(_serverNameToConnect, _clientName, _regionId, topic);
+
+            // Chỉ Serialize ra byte[] và ném vào Phễu, hàm này return ngay lập tức (< 0.001ms)
             var (buffer, length) = NatifySerializer.Serialize(message);
-            _publishChannel.Writer.TryWrite((subject, buffer, length));
+            var exactData = new byte[length];
+            Array.Copy(buffer, exactData, length);
+            System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
+
+            _batchChannel.Writer.TryWrite((subject, exactData));
         }
 
         // Bỏ async void, thay bằng void và bọc Task bên trong
@@ -77,32 +273,56 @@ namespace Natify
                     await foreach (var msg in _connection.SubscribeAsync<byte[]>(subject, queueGroup: _groupName,
                                        cancellationToken: _cts.Token))
                     {
-                        // KHÔNG DÙNG: if (msg.Data == null) continue;
+                        // A. XỬ LÝ ĐỘ TIN CẬY (ACK & DEDUPLICATION)
+                        msg.Headers?.TryGetValue("Natify-MsgId", out var messageId);
+                        var payload = msg.Data ?? Array.Empty<byte>();
 
+                        // BÁO CÁO: Ghi nhận số lượng bytes nhận được
+                        Trigger.AddReceived(payload.Length, 1);
+
+                        if (!string.IsNullOrEmpty(messageId))
+                        {
+                            // 1. Bắn ACK báo cho Server biết đã nhận
+                            string ackSubject =
+                                $"NatifyServer.{_serverNameToConnect}.{_clientName}.{_regionId}.ACK.{messageId}";
+                            _ = _connection.PublishAsync(ackSubject, Array.Empty<byte>()).AsTask();
+
+                            // 2. Kiểm tra trùng lặp
+                            if (_processedMessages.TryAdd(messageId, 1))
+                            {
+                                // BÁO CÁO: Thêm vào bộ đếm Cache
+                                Trigger.AddDedupItem();
+
+                                // 3. Cho vào TimeWheel đếm ngược 10 giây tự xóa
+                                long expireTimeMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + 10_000;
+                                _messageTtlWheel.AddOrUpdate(messageId, 1, expireTimeMs);
+                            }
+                            else
+                            {
+                                // Trùng lặp -> Bỏ qua
+                                continue;
+                            }
+                        }
+
+                        // B. XỬ LÝ LOGIC GAME (Đưa lên Main Thread của Client/Unity)
                         _mainThreadActions.Enqueue(() =>
                         {
                             try
                             {
-                                // Xử lý an toàn tin nhắn 0 byte
                                 var payload = msg.Data ?? Array.Empty<byte>();
                                 var data = NatifySerializer.Deserialize<T>(payload, payload.Length);
-
                                 callback(data);
                             }
                             catch (Exception ex)
                             {
-                                LogCallbackException(topic, ex);
+                                Trigger.AddError();
+                                LogError($"[NatifyClient] OnMessageReliable Error on {topic}: {ex.Message}");
                             }
                         });
                     }
                 }
                 catch (OperationCanceledException)
                 {
-                    /* Bỏ qua khi Dispose */
-                }
-                catch (Exception ex)
-                {
-                    LogError($"[Natify] Subscribe Error on {topic}: {ex.Message}");
                 }
             });
         }
@@ -281,66 +501,6 @@ namespace Natify
             }
         }
 
-        private async Task PublishWorkerAsync()
-        {
-            var reader = _publishChannel.Reader;
-            var batch = new System.Collections.Generic.List<(string Subject, byte[] Data, int Length)>(50);
-
-            try
-            {
-                while (await reader.WaitToReadAsync(_cts.Token))
-                {
-                    // 1. Rút nhanh nhất có thể các tin nhắn hiện có (Tối đa 50)
-                    while (batch.Count < 50 && reader.TryRead(out var msg))
-                    {
-                        batch.Add(msg);
-                    }
-
-                    // 2. Nếu chưa đủ 50 tin, chờ 10ms xem có ai gửi thêm không (Dùng Delay siêu an toàn)
-                    if (batch.Count > 0 && batch.Count < 50)
-                    {
-                        try
-                        {
-                            await Task.Delay(10, _cts.Token);
-                        }
-                        catch (OperationCanceledException)
-                        {
-                        }
-
-                        // Rút nốt những tin nhắn mới bay vào trong 10ms vừa qua
-                        while (batch.Count < 50 && reader.TryRead(out var moreMsg))
-                        {
-                            batch.Add(moreMsg);
-                        }
-                    }
-
-                    // 3. Xả Batch xuống NATS
-                    if (batch.Count > 0)
-                    {
-                        foreach (var m in batch)
-                        {
-                            var exactData = new byte[m.Length];
-                            Array.Copy(m.Data, exactData, m.Length);
-                            System.Buffers.ArrayPool<byte>.Shared.Return(m.Data);
-
-                            // [QUAN TRỌNG NHẤT]: Phải có await ở đây để NATS đẩy TCP tuần tự, không tràn buffer
-                            await _connection.PublishAsync(m.Subject, exactData, cancellationToken: _cts.Token);
-                        }
-
-                        batch.Clear();
-                    }
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                /* Bỏ qua khi tắt game/server */
-            }
-            catch (Exception ex)
-            {
-                LogError($"[Natify] PublishWorker failed: {ex.Message}");
-            }
-        }
-
         private void LogCallbackException(string topic, Exception ex)
         {
             var st = new StackTrace(ex, true);
@@ -364,21 +524,40 @@ namespace Natify
 
         public void Dispose()
         {
-            // Cờ bảo vệ: Đã Dispose rồi thì không làm gì nữa
             if (_isDisposed) return;
             _isDisposed = true;
 
+            Trigger.Dispose();
+
+            // BƯỚC 1: Khóa van đầu vào - Từ chối mọi lệnh Publish mới
+            // (Luồng ngầm BatchWorker vẫn đang chạy bình thường)
+            _batchChannel.Writer.Complete();
+
+            // BƯỚC 2: Chờ luồng ngầm xả nốt hàng tồn kho
+            // Khi Channel trống rỗng, WaitToReadAsync sẽ tự động trả về false và kết thúc.
+            // Đặt timeout 2 giây để tránh treo Game/App nếu bị lỗi mạng không gửi được.
+            if (_batchWorkerTask != null)
+            {
+                try
+                {
+                    _batchWorkerTask.Wait(TimeSpan.FromSeconds(2));
+                }
+                catch
+                {
+                    /* Bỏ qua nếu có lỗi trong quá trình xả nốt */
+                }
+            }
+
+            // BƯỚC 3: Bây giờ mới sập cầu dao (Hủy Token) để dừng các luồng Lắng nghe (Subscribe)
             try
             {
                 _cts.Cancel();
             }
             catch
             {
-                /* Bỏ qua lỗi nếu Token đã bị huỷ */
             }
 
-            _publishChannel.Writer.Complete();
-
+            // BƯỚC 4: Ngắt kết nối NATS
             try
             {
                 _connection.DisposeAsync().AsTask().GetAwaiter().GetResult();

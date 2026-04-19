@@ -833,16 +833,16 @@ namespace Natify.Tests
         [Category("Performance")]
         public async Task Test24_Performance_Throughput_ShouldExceed10000MPS()
         {
-            int totalMessages = 20_000;
+            int totalMessages = 100_000;
             int receivedCount = 0;
             var waitHandle = new ManualResetEventSlim(false);
             
-            HashSet<int> sentTracker = new HashSet<int>();
-            HashSet<int> receivedTracker = new HashSet<int>();
+            ConcurrentDictionary<int, byte> sentTracker = new();
+            ConcurrentDictionary<int, byte> receivedTracker = new();
 
             _server.OnMessage<Int32Value>("ThroughputTest", data => 
             {
-                receivedTracker.Add(data.data.Value);
+                receivedTracker.TryAdd(data.data.Value, 1);
                 
                 if (Interlocked.Increment(ref receivedCount) == totalMessages)
                 {
@@ -860,7 +860,7 @@ namespace Natify.Tests
                 for (int i = 0; i < totalMessages; i++)
                 {
                     _clientA.Publish("ThroughputTest", new Int32Value { Value = i });
-                    sentTracker.Add(i);
+                    sentTracker.TryAdd(i, 1);
                 }
             });
 
@@ -868,9 +868,7 @@ namespace Natify.Tests
             bool success = waitHandle.Wait(TimeSpan.FromSeconds(10));
             stopwatch.Stop();
             
-            HashSet<int> missingMessages = new HashSet<int>(sentTracker);
-            missingMessages.ExceptWith(receivedTracker);
-            
+            var missingMessages = sentTracker.Keys.Except(receivedTracker.Keys).ToList();
             
 
             Assert.That(success, Is.True, $"Timeout! Chỉ nhận được {receivedCount}/{totalMessages}, cac data bị miss {string.Join(",", missingMessages)}");
