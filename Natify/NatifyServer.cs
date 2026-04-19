@@ -3,6 +3,7 @@ using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using Google.Protobuf;
 using NATS.Client.Core;
@@ -14,8 +15,16 @@ namespace Natify
         private readonly ConcurrentDictionary<string, byte> _processedMessages = new();
         private readonly TimedSortedSet<string, byte> _messageTtlWheel = new();
 
+        private readonly Channel<(string Subject, byte[] Payload)> _batchChannel =
+            Channel.CreateUnbounded<(string, byte[])>();
+
+        private Task _batchWorkerTask;
+        private const int MaxCount = 1000;
+        private const int MaxSize = 50 * 1024; // 50 KB
+        private readonly TimeSpan MaxWait = TimeSpan.FromMilliseconds(50);
+
         private readonly ConcurrentDictionary<string, UnackedMessage> _unackedMessages = new();
-        private readonly TimeSpan _ackTimeout = TimeSpan.FromMilliseconds(500);
+        private readonly TimeSpan _ackTimeout = TimeSpan.FromMilliseconds(100);
         private readonly int _maxRetries = 10;
         public NatifyServerTriggers Trigger { get; } = new();
 
@@ -42,6 +51,7 @@ namespace Natify
             _connection.ConnectAsync().AsTask().GetAwaiter().GetResult();
             _cts = new CancellationTokenSource();
             StartServerReliablePublishFeatures();
+            _batchWorkerTask = Task.Run(BatchWorkerAsync);
         }
 
         private void OnMessagesExpired(IReadOnlyList<(string Key, byte Value)> expiredItems)
@@ -125,29 +135,14 @@ namespace Natify
             if (_isDisposed) return;
 
             var subject = NatifyTopics.GetServerPublishSubject(_clientNameToConnect, _serverName, regionId, topic);
-            string messageId = Guid.NewGuid().ToString("N");
-
+    
             var (buffer, length) = NatifySerializer.Serialize(message);
             var exactData = new byte[length];
             Array.Copy(buffer, exactData, length);
-            ArrayPool<byte>.Shared.Return(buffer);
+            System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
 
-            // Ghi nhận số liệu (Nếu bạn đang dùng hệ thống Trigger)
-            Trigger?.AddSent(length, 1);
-
-            var unackedMsg = new UnackedMessage
-            {
-                Subject = subject,
-                Payload = exactData,
-                MessageId = messageId,
-                LastSent = DateTime.UtcNow,
-                RetryCount = 0
-            };
-
-            _unackedMessages.TryAdd(messageId, unackedMsg);
-
-            var headers = new NatsHeaders { ["Natify-MsgId"] = messageId };
-            _ = _connection.PublishAsync(subject, exactData, headers: headers).AsTask();
+            // Bắn vào Phễu
+            _batchChannel.Writer.TryWrite((subject, exactData));
         }
 
         // Khử async void, thay bằng void và khởi chạy Task
@@ -382,10 +377,94 @@ namespace Natify
             });
         }
 
+        // Thêm hàm BatchWorkerAsync vào NatifyServer:
+        private async Task BatchWorkerAsync()
+        {
+            var reader = _batchChannel.Reader;
+
+            while (await reader.WaitToReadAsync(_cts.Token))
+            {
+                var batches = new Dictionary<string, NatifyBatch>();
+                int currentCount = 0;
+                int currentSizeBytes = 0;
+                var batchStartTime = DateTime.UtcNow;
+
+                while (currentCount < MaxCount && currentSizeBytes < MaxSize)
+                {
+                    var elapsed = DateTime.UtcNow - batchStartTime;
+                    if (elapsed >= MaxWait) break;
+
+                    if (reader.TryRead(out var item))
+                    {
+                        if (!batches.TryGetValue(item.Subject, out var batch))
+                        {
+                            batch = new NatifyBatch();
+                            batches[item.Subject] = batch;
+                        }
+
+                        batch.Payloads.Add(ByteString.CopyFrom(item.Payload));
+                        currentCount++;
+                        currentSizeBytes += item.Payload.Length;
+                    }
+                    else
+                    {
+                        var timeLeft = MaxWait - elapsed;
+                        try
+                        {
+                            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+                            timeoutCts.CancelAfter(timeLeft);
+                            await reader.WaitToReadAsync(timeoutCts.Token);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            break;
+                        }
+                    }
+                }
+
+                if (currentCount > 0)
+                {
+                    foreach (var kvp in batches)
+                    {
+                        string subject = kvp.Key;
+                        NatifyBatch batchMsg = kvp.Value;
+                        string messageId = Guid.NewGuid().ToString("N");
+
+                        var (buffer, length) = NatifySerializer.Serialize(batchMsg);
+                        var exactData = new byte[length];
+                        Array.Copy(buffer, exactData, length);
+                        System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
+
+                        // Ghi nhận tổng số tin nhắn lẻ
+                        Trigger.AddSent(length, batchMsg.Payloads.Count);
+
+                        var unackedMsg = new UnackedMessage
+                        {
+                            Subject = subject,
+                            Payload = exactData,
+                            MessageId = messageId,
+                            LastSent = DateTime.UtcNow,
+                            RetryCount = 0
+                        };
+
+                        _unackedMessages.TryAdd(messageId, unackedMsg);
+
+                        var headers = new NatsHeaders { ["Natify-MsgId"] = messageId };
+                        await _connection.PublishAsync(subject, exactData, headers: headers,
+                            cancellationToken: _cts.Token);
+                    }
+                }
+            }
+        }
+
         public void Dispose()
         {
             if (_isDisposed) return;
-            _isDisposed = true; // Ngăn chặn các hàm Publish mới được thực thi
+            _isDisposed = true;
+
+            // Khóa van Phễu (Thêm 2 dòng này)
+            _batchChannel.Writer.Complete();
+            if (_batchWorkerTask != null) { try { _batchWorkerTask.Wait(TimeSpan.FromSeconds(2)); } catch { } }
 
             // BƯỚC 1: Chờ đợi "Xả hàng" (Drain)
             // Chúng ta đợi tối đa 2 giây để:

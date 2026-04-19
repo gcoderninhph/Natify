@@ -276,50 +276,58 @@ namespace Natify
                     await foreach (var msg in _connection.SubscribeAsync<byte[]>(subject, queueGroup: _groupName,
                                        cancellationToken: _cts.Token))
                     {
-                        // A. XỬ LÝ ĐỘ TIN CẬY (ACK & DEDUPLICATION)
                         msg.Headers?.TryGetValue("Natify-MsgId", out var messageId);
                         var payload = msg.Data ?? Array.Empty<byte>();
 
-                        // BÁO CÁO: Ghi nhận số lượng bytes nhận được
-                        Trigger.AddReceived(payload.Length, 1);
-
                         if (!string.IsNullOrEmpty(messageId))
                         {
-                            // 1. Bắn ACK báo cho Server biết đã nhận
                             string ackSubject =
                                 $"NatifyServer.{_serverNameToConnect}.{_clientName}.{_regionId}.ACK.{messageId}";
                             _ = _connection.PublishAsync(ackSubject, Array.Empty<byte>()).AsTask();
 
-                            // 2. Kiểm tra trùng lặp
                             if (_processedMessages.TryAdd(messageId, 1))
                             {
-                                // BÁO CÁO: Thêm vào bộ đếm Cache
                                 Trigger.AddDedupItem();
-
-                                // 3. Cho vào TimeWheel đếm ngược 10 giây tự xóa
                                 long expireTimeMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + 10_000;
                                 _messageTtlWheel.AddOrUpdate(messageId, 1, expireTimeMs);
                             }
                             else
                             {
-                                // Trùng lặp -> Bỏ qua
-                                continue;
+                                continue; // Trùng lặp
                             }
                         }
 
-                        // B. XỬ LÝ LOGIC GAME (Đưa lên Main Thread của Client/Unity)
+                        // 1. Giải nén Batch ĐẠI DIỆN ở luồng ngầm
+                        NatifyBatch batch = null;
+                        try
+                        {
+                            batch = NatifySerializer.Deserialize<NatifyBatch>(payload, payload.Length);
+                            Trigger.AddReceived(payload.Length, batch.Payloads.Count);
+                        }
+                        catch (Exception ex)
+                        {
+                            Trigger.AddError();
+                            LogError($"[NatifyClient] Error Parsing Batch: {ex.Message}");
+                            continue; // Lỗi thì bỏ qua
+                        }
+
+                        // 2. NHÉT NGUYÊN 1 LÔ VÀO QUEUE THAY VÌ TỪNG TIN NHẮN MỘT
+                        // Nhờ vậy, 100,000 tin nhắn chỉ tốn 100 cục Action trong RAM!
                         _mainThreadActions.Enqueue(() =>
                         {
                             try
                             {
-                                var payload = msg.Data ?? Array.Empty<byte>();
-                                var data = NatifySerializer.Deserialize<T>(payload, payload.Length);
-                                callback(data);
+                                foreach (var byteString in batch.Payloads)
+                                {
+                                    byte[] itemBytes = byteString.ToByteArray();
+                                    var data = NatifySerializer.Deserialize<T>(itemBytes, itemBytes.Length);
+                                    callback(data);
+                                }
                             }
                             catch (Exception ex)
                             {
                                 Trigger.AddError();
-                                LogError($"[NatifyClient] OnMessageReliable Error on {topic}: {ex.Message}");
+                                LogError($"[NatifyClient] OnMessage Error on {topic}: {ex.Message}");
                             }
                         });
                     }

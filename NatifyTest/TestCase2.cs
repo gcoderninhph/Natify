@@ -527,11 +527,10 @@ namespace Natify.Tests
             // Quan trọng nhất: Tổng thời gian phải xoay quanh 1 giây (chứng tỏ chạy song song), không được là 2 giây
             Assert.That(stopwatch.ElapsedMilliseconds, Is.LessThan(1500), "Server xử lý tuần tự thay vì song song!");
         }
-        
+
         /// <summary>
         /// Kịch bản 15 sẽ mô phỏng nhịp đập 60 FPS của Unity để Client tính toán trả lời. Kịch bản 16 sẽ chứng minh hệ thống Server không bị treo nếu Client tắt game đột ngột.
         /// </summary>
-
         [Test]
         public async Task Test15_ServerToClient_RPC_ShouldReturnReplyViaTick()
         {
@@ -594,7 +593,7 @@ namespace Natify.Tests
             Assert.That(ex.Message, Does.Contain("Timeout").IgnoreCase,
                 "Server bị treo hoặc văng lỗi lạ khi Client không trả lời!");
         }
-        
+
         [Test]
         public async Task Test17_StrictThreadCheck_CallbackMustExecuteOnTickThread()
         {
@@ -613,35 +612,33 @@ namespace Natify.Tests
 
             // ACT 1: Server bắn tin nhắn xuống
             _server.Publish("ThreadCheckTopic", "VN-01", new StringValue { Value = "CheckThread" });
-    
+
             // Đợi 500ms cho đạn bay qua mạng. 
             await Task.Delay(500); // NUnit lại tiếp tục nhảy luồng sau dòng này
 
             Assert.That(processCount, Is.EqualTo(0), "Callback đã tự động chạy trước khi gọi Tick!");
 
             // ACT 2: Lấy Thread ID NGAY TRƯỚC KHI gọi Tick
-            int tickThreadId = Thread.CurrentThread.ManagedThreadId; 
+            int tickThreadId = Thread.CurrentThread.ManagedThreadId;
             _clientA.Tick(); // Hàm Tick được gọi bởi tickThreadId
 
             // ASSERT 2
             Assert.That(processCount, Is.EqualTo(1), "Tick không lấy được tin nhắn ra khỏi Queue.");
-    
+
             // BẰNG CHỨNG THÉP
             Assert.That(callbackThreadId, Is.Not.EqualTo(-1), "Callback chưa ghi nhận được Thread ID");
-            Assert.That(callbackThreadId, Is.EqualTo(tickThreadId), 
+            Assert.That(callbackThreadId, Is.EqualTo(tickThreadId),
                 $"LỆCH LUỒNG! Callback chạy ở luồng {callbackThreadId}, nhưng luồng gọi Tick là {tickThreadId}");
         }
-        
+
         [Test]
         public async Task Test18_MassiveRPC_10000Requests_ShouldNotDropAny()
         {
             int totalRequests = 10000;
-    
+
             // Server chỉ đơn giản là nối chuỗi để trả về
-            _server.OnRequest<Int32Value, StringValue>("MassivePing", incoming => 
-            {
-                return new StringValue { Value = $"Pong_{incoming.request.Value}" };
-            });
+            _server.OnRequest<Int32Value, StringValue>("MassivePing",
+                incoming => { return new StringValue { Value = $"Pong_{incoming.request.Value}" }; });
 
             await Task.Delay(500);
 
@@ -653,8 +650,8 @@ namespace Natify.Tests
             {
                 int requestId = i;
                 tasks.Add(_clientA.RequestAsync<Int32Value, StringValue>(
-                    "MassivePing", 
-                    new Int32Value { Value = requestId }, 
+                    "MassivePing",
+                    new Int32Value { Value = requestId },
                     TimeSpan.FromSeconds(10))); // Cho timeout dài một chút vì xử lý 10k request tốn CPU
             }
 
@@ -664,7 +661,7 @@ namespace Natify.Tests
 
             // Assert
             Assert.That(results.Length, Is.EqualTo(totalRequests), "Bị rớt gói! Số lượng phản hồi không đủ.");
-    
+
             // Kiểm tra tính nguyên vẹn: Request số 9999 phải nhận đúng chữ "Pong_9999" (Không bị râu ông nọ cắm cằm bà kia)
             for (int i = 0; i < totalRequests; i++)
             {
@@ -673,16 +670,17 @@ namespace Natify.Tests
 
             Console.WriteLine($"[Test18] Hoàn thành 10.000 RPC Requests trong {stopwatch.ElapsedMilliseconds} ms!");
         }
-        
+
         [Test]
         public async Task Test19_ServerResilience_ShouldSurviveUserCodeExceptions()
         {
-            _server.OnRequest<StringValue, StringValue>("RiskyLogic", incoming => 
+            _server.OnRequest<StringValue, StringValue>("RiskyLogic", incoming =>
             {
                 if (incoming.request.Value == "CRASH_ME")
                 {
                     throw new InvalidOperationException("Lỗi Logic Game Nghiêm Trọng!");
                 }
+
                 return new StringValue { Value = "SAFE_" + incoming.request.Value };
             });
 
@@ -692,8 +690,8 @@ namespace Natify.Tests
             var ex = Assert.ThrowsAsync<TimeoutException>(async () =>
             {
                 await _clientA.RequestAsync<StringValue, StringValue>(
-                    "RiskyLogic", 
-                    new StringValue { Value = "CRASH_ME" }, 
+                    "RiskyLogic",
+                    new StringValue { Value = "CRASH_ME" },
                     TimeSpan.FromSeconds(1));
             });
 
@@ -702,14 +700,15 @@ namespace Natify.Tests
 
             // ACT 2: Lập tức gửi một lệnh bình thường xem Server còn sống không?
             var survivalResponse = await _clientA.RequestAsync<StringValue, StringValue>(
-                "RiskyLogic", 
-                new StringValue { Value = "HELLO" }, 
+                "RiskyLogic",
+                new StringValue { Value = "HELLO" },
                 TimeSpan.FromSeconds(2));
 
             // Assert: Server vẫn sống nhăn răng và trả lời bình thường!
-            Assert.That(survivalResponse.Value, Is.EqualTo("SAFE_HELLO"), "Server đã bị Crash hoàn toàn bởi lỗi trước đó!");
+            Assert.That(survivalResponse.Value, Is.EqualTo("SAFE_HELLO"),
+                "Server đã bị Crash hoàn toàn bởi lỗi trước đó!");
         }
-        
+
         [Test]
         public async Task Test20_FIFO_OrderGuarantee_ShouldNotShuffleMessages()
         {
@@ -717,7 +716,7 @@ namespace Natify.Tests
             var receivedList = new System.Collections.Generic.List<int>();
             var waitHandle = new ManualResetEventSlim(false);
 
-            _server.OnMessage<Int32Value>("MovementSteps", data => 
+            _server.OnMessage<Int32Value>("MovementSteps", data =>
             {
                 lock (receivedList) // Lock để đảm bảo List an toàn khi add
                 {
@@ -738,14 +737,15 @@ namespace Natify.Tests
 
             // Assert
             Assert.That(receivedList.Count, Is.EqualTo(totalMessages));
-    
+
             // Kiểm tra xem có bị lộn xộn không (Vd: 0, 1, 3, 2, 4...)
             for (int i = 0; i < totalMessages; i++)
             {
-                Assert.That(receivedList[i], Is.EqualTo(i), $"Lỗi thứ tự! Đáng lẽ nhận được {i} nhưng lại nhận {receivedList[i]}");
+                Assert.That(receivedList[i], Is.EqualTo(i),
+                    $"Lỗi thứ tự! Đáng lẽ nhận được {i} nhưng lại nhận {receivedList[i]}");
             }
         }
-        
+
         [Test]
         public async Task Test21_UTF8_Emoji_ShouldSerializeCorrectly()
         {
@@ -753,7 +753,7 @@ namespace Natify.Tests
             string receivedText = "";
             var waitHandle = new ManualResetEventSlim(false);
 
-            _server.OnMessage<StringValue>("WorldChat", data => 
+            _server.OnMessage<StringValue>("WorldChat", data =>
             {
                 receivedText = data.data.Value;
                 waitHandle.Set();
@@ -767,12 +767,12 @@ namespace Natify.Tests
 
             Assert.That(receivedText, Is.EqualTo(complexText), "Lỗi Encoding! Dữ liệu bị biến dạng khi gửi qua mạng.");
         }
-        
+
         [Test]
         public void Test22_Tick_WhenQueueIsEmpty_ShouldNotThrowOrDegrade()
         {
             // Giả lập Game đang chạy 100,000 frames nhưng không có message mạng nào
-            Assert.DoesNotThrow(() => 
+            Assert.DoesNotThrow(() =>
             {
                 for (int i = 0; i < 100_000; i++)
                 {
@@ -780,7 +780,7 @@ namespace Natify.Tests
                 }
             }, "Hàm Tick bị lỗi khi xử lý Queue trống!");
         }
-        
+
         [Test]
         public async Task Test23_ClientAsyncRPC_ShouldProcessAndReplyCorrectly()
         {
@@ -788,8 +788,8 @@ namespace Natify.Tests
             _clientA.OnRequest<StringValue, StringValue>("LoadPlayerData", async req =>
             {
                 // Giả lập Client đang phải đọc file hoặc load Asset bundle mất 500ms
-                await Task.Delay(500); 
-        
+                await Task.Delay(500);
+
                 return new StringValue { Value = $"Loaded_{req.Value}" };
             });
 
@@ -822,13 +822,13 @@ namespace Natify.Tests
             // 4. ASSERT
             Assert.That(response, Is.Not.Null);
             Assert.That(response.Value, Is.EqualTo("Loaded_Profile_Alex"));
-    
+
             // Đảm bảo rằng Request thực sự tốn ít nhất 500ms (chứng tỏ hàm await Task.Delay trong Client đã hoạt động)
-            Assert.That(stopwatch.ElapsedMilliseconds, Is.GreaterThanOrEqualTo(500), 
+            Assert.That(stopwatch.ElapsedMilliseconds, Is.GreaterThanOrEqualTo(500),
                 "Client không thực sự chạy bất đồng bộ (chưa đợi đủ 500ms đã trả lời)!");
         }
-        
-        
+
+
         [Test]
         [Category("Performance")]
         public async Task Test24_Performance_Throughput_ShouldExceed10000MPS()
@@ -836,14 +836,14 @@ namespace Natify.Tests
             int totalMessages = 100_000;
             int receivedCount = 0;
             var waitHandle = new ManualResetEventSlim(false);
-            
+
             ConcurrentDictionary<int, byte> sentTracker = new();
             ConcurrentDictionary<int, byte> receivedTracker = new();
 
-            _server.OnMessage<Int32Value>("ThroughputTest", data => 
+            _server.OnMessage<Int32Value>("ThroughputTest", data =>
             {
                 receivedTracker.TryAdd(data.data.Value, 1);
-                
+
                 if (Interlocked.Increment(ref receivedCount) == totalMessages)
                 {
                     waitHandle.Set();
@@ -855,7 +855,7 @@ namespace Natify.Tests
             var stopwatch = System.Diagnostics.Stopwatch.StartNew();
 
             // Act: Xả 100.000 tin nhắn nhanh nhất có thể (Sử dụng Task.Run để không block luồng test)
-            _ = Task.Run(() => 
+            _ = Task.Run(() =>
             {
                 for (int i = 0; i < totalMessages; i++)
                 {
@@ -867,30 +867,33 @@ namespace Natify.Tests
             // Chờ tối đa 10 giây
             bool success = waitHandle.Wait(TimeSpan.FromSeconds(10));
             stopwatch.Stop();
-            
-            var missingMessages = sentTracker.Keys.Except(receivedTracker.Keys).ToList();
-            
 
-            Assert.That(success, Is.True, $"Timeout! Chỉ nhận được {receivedCount}/{totalMessages}, cac data bị miss {string.Join(",", missingMessages)}");
+            var missingMessages = sentTracker.Keys.Except(receivedTracker.Keys).ToList();
+
+
+            Assert.That(success, Is.True,
+                $"Timeout! Chỉ nhận được {receivedCount}/{totalMessages}, cac data bị miss {string.Join(",", missingMessages)}");
 
             // Tính toán MPS
             double seconds = stopwatch.Elapsed.TotalSeconds;
             double mps = totalMessages / seconds;
 
-            Console.WriteLine($"[Test 24] Đã nhận {totalMessages:N0} tin nhắn trong {seconds:F3}s. Tốc độ: {mps:N0} MPS.");
+            Console.WriteLine(
+                $"[Test 24] Đã nhận {totalMessages:N0} tin nhắn trong {seconds:F3}s. Tốc độ: {mps:N0} MPS.");
 
             // Assert hiệu suất tối thiểu (Ví dụ: phải lớn hơn 10.000 tin nhắn / giây)
-            Assert.That(mps, Is.GreaterThan(1000), "Hiệu suất quá thấp, có thể đang bị nghẽn cổ chai ở Serialize hoặc Channel!");
+            Assert.That(mps, Is.GreaterThan(1000),
+                "Hiệu suất quá thấp, có thể đang bị nghẽn cổ chai ở Serialize hoặc Channel!");
         }
-        
+
         [Test]
         [Category("Performance")]
         public async Task Test25_Performance_Latency_AverageRTT_ShouldBeUnder2ms()
         {
             int iterations = 1000;
-    
+
             // Server phản hồi nhanh nhất có thể
-            _server.OnRequest<Int32Value, Int32Value>("LatencyPing", incoming => 
+            _server.OnRequest<Int32Value, Int32Value>("LatencyPing", incoming =>
             {
                 return incoming.request; // Trả lại y nguyên để tiết kiệm thời gian
             });
@@ -898,9 +901,10 @@ namespace Natify.Tests
             await Task.Delay(500);
 
             // Warmup: Bắn vài phát đầu tiên để JIT Compiler dịch code (Loại bỏ thời gian khởi động)
-            for (int i = 0; i < 5; i++) 
+            for (int i = 0; i < 5; i++)
             {
-                await _clientA.RequestAsync<Int32Value, Int32Value>("LatencyPing", new Int32Value { Value = 0 }, TimeSpan.FromSeconds(1));
+                await _clientA.RequestAsync<Int32Value, Int32Value>("LatencyPing", new Int32Value { Value = 0 },
+                    TimeSpan.FromSeconds(1));
             }
 
             var stopwatch = System.Diagnostics.Stopwatch.StartNew();
@@ -909,8 +913,8 @@ namespace Natify.Tests
             for (int i = 0; i < iterations; i++)
             {
                 await _clientA.RequestAsync<Int32Value, Int32Value>(
-                    "LatencyPing", 
-                    new Int32Value { Value = i }, 
+                    "LatencyPing",
+                    new Int32Value { Value = i },
                     TimeSpan.FromSeconds(1));
             }
 
@@ -919,12 +923,13 @@ namespace Natify.Tests
             double totalMs = stopwatch.Elapsed.TotalMilliseconds;
             double averageLatencyMs = totalMs / iterations;
 
-            Console.WriteLine($"[Test 25] 1000 vòng Ping-Pong tốn {totalMs:F2}ms. Độ trễ trung bình RTT: {averageLatencyMs:F4} ms/request.");
+            Console.WriteLine(
+                $"[Test 25] 1000 vòng Ping-Pong tốn {totalMs:F2}ms. Độ trễ trung bình RTT: {averageLatencyMs:F4} ms/request.");
 
             // Assert độ trễ: Quá 2ms trên localhost là code đang có vấn đề về Thread/Locking
             Assert.That(averageLatencyMs, Is.LessThan(2.0), "Độ trễ trung bình quá cao!");
         }
-        
+
         [Test]
         [Category("Performance")]
         public async Task Test26_Performance_Memory_ShouldNotTriggerFrequentGarbageCollection()
@@ -933,7 +938,7 @@ namespace Natify.Tests
             var waitHandle = new ManualResetEventSlim(false);
             int received = 0;
 
-            _server.OnMessage<Int32Value>("MemoryTest", data => 
+            _server.OnMessage<Int32Value>("MemoryTest", data =>
             {
                 if (Interlocked.Increment(ref received) == totalMessages)
                     waitHandle.Set();
@@ -950,7 +955,7 @@ namespace Natify.Tests
             int initialGen0Collections = GC.CollectionCount(0);
 
             // Act
-            _ = Task.Run(() => 
+            _ = Task.Run(() =>
             {
                 for (int i = 0; i < totalMessages; i++)
                 {
@@ -964,10 +969,716 @@ namespace Natify.Tests
             int finalGen0Collections = GC.CollectionCount(0);
             int collectionsHappened = finalGen0Collections - initialGen0Collections;
 
-            Console.WriteLine($"[Test 26] Sau {totalMessages:N0} tin nhắn, GC Gen 0 đã chạy {collectionsHappened} lần.");
+            Console.WriteLine(
+                $"[Test 26] Sau {totalMessages:N0} tin nhắn, GC Gen 0 đã chạy {collectionsHappened} lần.");
 
             // Assert: Đối với 50.000 tin nhắn, nếu ArrayPool hoạt động tốt, GC gần như không chạy (Dưới 5 lần là quá tuyệt vời).
-            Assert.That(collectionsHappened, Is.LessThan(10), "Memory Leak (Sinh quá nhiều rác)! ArrayPool có thể chưa được tận dụng triệt để.");
+            Assert.That(collectionsHappened, Is.LessThan(10),
+                "Memory Leak (Sinh quá nhiều rác)! ArrayPool có thể chưa được tận dụng triệt để.");
+        }
+
+        [Test]
+        [Category("Metrics")]
+        public async Task Test27_Telemetry_Triggers_ShouldTrackCorrectMetrics()
+        {
+            int totalMessages = 2500;
+            var waitHandle = new ManualResetEventSlim(false);
+            int receivedCount = 0;
+
+            // Reset lại Trigger (Bằng cách lấy số liệu ban đầu làm mốc)
+            long initialClientSent = _clientA.Trigger.MessagesSent;
+            long initialServerReceived = _server.Trigger.MessagesReceived;
+
+            _server.OnMessage<Int32Value>("TriggerTest", data =>
+            {
+                if (Interlocked.Increment(ref receivedCount) == totalMessages)
+                {
+                    waitHandle.Set();
+                }
+            });
+
+            await Task.Delay(500);
+
+            // Act
+            for (int i = 0; i < totalMessages; i++)
+            {
+                _clientA.Publish("TriggerTest", new Int32Value { Value = i });
+            }
+
+            bool success = waitHandle.Wait(TimeSpan.FromSeconds(5));
+
+            // Assert
+            Assert.That(success, Is.True, "Server không nhận đủ tin nhắn.");
+
+            long clientSentCount = _clientA.Trigger.MessagesSent - initialClientSent;
+            long serverReceivedCount = _server.Trigger.MessagesReceived - initialServerReceived;
+
+            // 1. Kiểm tra số lượng Message lẻ
+            Assert.That(clientSentCount, Is.EqualTo(totalMessages), "Client Trigger đếm sai số lượng gửi đi!");
+            Assert.That(serverReceivedCount, Is.EqualTo(totalMessages), "Server Trigger đếm sai số lượng nhận vào!");
+
+            // 2. Kiểm tra Batching (2500 tin nhắn gửi cực nhanh thì số lượng Batch chắc chắn phải < 2500)
+            long clientBatches = _clientA.Trigger.BatchesSent;
+            long serverBatches = _server.Trigger.BatchesReceived;
+
+            Assert.That(clientBatches, Is.GreaterThan(0).And.LessThan(totalMessages),
+                "Micro-Batching không hoạt động! Gửi từng tin nhắn một.");
+            Assert.That(serverBatches, Is.GreaterThan(0), "Server không ghi nhận được Batch nào.");
+
+            Console.WriteLine(
+                $"[Test 27] 2500 tin nhắn được nhồi vào {clientBatches} Batches. RAM Client: {_clientA.Trigger.ProcessMemoryMB:F1}MB, RAM Server: {_server.Trigger.ProcessMemoryMB:F1}MB");
+        }
+
+        [Test]
+        [Category("Reliability")]
+        public async Task Test28_Deduplication_ShouldProcessDuplicateMessagesOnlyOnce()
+        {
+            int processCount = 0;
+            var waitHandle = new CountdownEvent(1);
+
+            _server.OnMessage<StringValue>("DedupTest", data =>
+            {
+                Interlocked.Increment(ref processCount);
+                waitHandle.Signal();
+            });
+
+            await Task.Delay(500);
+
+            // ĐÓNG GIẢ MỘT GÓI TIN ĐÃ GOM BATCH VỚI ID CỐ ĐỊNH
+            string fakeMessageId = "HACKER_DUPE_ID_9999";
+            var batchMsg = new NatifyBatch();
+            var payload = new StringValue { Value = "Gold + 1000" };
+
+            var (buffer, length) = NatifySerializer.Serialize(payload);
+            var exactData = new byte[length];
+            Array.Copy(buffer, exactData, length);
+            batchMsg.Payloads.Add(Google.Protobuf.ByteString.CopyFrom(exactData));
+
+            var (batchBuffer, batchLength) = NatifySerializer.Serialize(batchMsg);
+            var exactBatchData = new byte[batchLength];
+            Array.Copy(batchBuffer, exactBatchData, batchLength);
+
+            // Dùng NatsConnection thuần để bắn thẳng gói tin rác này vào Server 3 lần liên tiếp!
+            var rawNats = new NATS.Client.Core.NatsConnection(new NATS.Client.Core.NatsOpts { Url = NatsUrl });
+            await rawNats.ConnectAsync();
+
+            string subject = NatifyTopics.GetClientPublishSubject("GameServer", "GameClient", "VN-01", "DedupTest");
+            var headers = new NATS.Client.Core.NatsHeaders { ["Natify-MsgId"] = fakeMessageId };
+
+            // Bắn 3 lần cùng 1 ID
+            await rawNats.PublishAsync(subject, exactBatchData, headers: headers);
+            await rawNats.PublishAsync(subject, exactBatchData, headers: headers);
+            await rawNats.PublishAsync(subject, exactBatchData, headers: headers);
+
+            // Chờ 2 giây
+            bool signaled = waitHandle.Wait(TimeSpan.FromSeconds(2));
+
+            // Assert
+            Assert.That(signaled, Is.True, "Server không nhận được gói tin.");
+
+            // ĐIỂM CỐT LÕI: Mặc dù bắn 3 lần, nhưng vì chung 1 MessageId, Server chỉ được phép gọi callback 1 lần.
+            Assert.That(processCount, Is.EqualTo(1),
+                "CẢNH BÁO LỖI BẢO MẬT: Server xử lý trùng lặp gói tin! Deduplication bị thủng.");
+
+            // Kiểm tra Trigger Cache
+            Assert.That(_server.Trigger.CurrentDedupCacheSize, Is.GreaterThanOrEqualTo(1),
+                "Cache ID không được ghi nhận vào Trigger.");
+
+            await rawNats.DisposeAsync();
+        }
+
+        [Test]
+        [Category("Reliability")]
+        public async Task Test29_ServerToClient_ReliableMessaging_ShouldWorkPerfectly()
+        {
+            int totalFromServer = 50;
+            int clientReceived = 0;
+            var waitHandle = new ManualResetEventSlim(false);
+
+            // 1. Client đăng ký lắng nghe (Nhớ phải gọi Tick thì Callback mới chạy)
+            _clientA.OnMessage<StringValue>("ServerPush", data =>
+            {
+                if (Interlocked.Increment(ref clientReceived) == totalFromServer)
+                {
+                    waitHandle.Set();
+                }
+            });
+
+            await Task.Delay(500);
+
+            // 2. Unity Game Loop ảo để Tick liên tục cho Client
+            var ctsUnityLoop = new CancellationTokenSource();
+            var unityGameLoop = Task.Run(async () =>
+            {
+                while (!ctsUnityLoop.IsCancellationRequested)
+                {
+                    _clientA.Tick();
+                    await Task.Delay(16);
+                }
+            });
+
+            // 3. Act: Server gửi 50 tin nhắn cho Client A
+            for (int i = 0; i < totalFromServer; i++)
+            {
+                _server.Publish("ServerPush", "VN-01", new StringValue { Value = $"Message_{i}" });
+            }
+
+            // 4. Chờ Client xử lý xong
+            bool success = waitHandle.Wait(TimeSpan.FromSeconds(5));
+            ctsUnityLoop.Cancel();
+
+            // 5. Assert
+            Assert.That(success, Is.True,
+                $"Client chỉ nhận được {clientReceived}/{totalFromServer} tin nhắn từ Server.");
+
+            // Kiểm tra Client có đẩy số liệu Trigger lên không
+            Assert.That(_clientA.Trigger.MessagesReceived, Is.GreaterThanOrEqualTo(totalFromServer));
+        }
+
+        [Test]
+        [Category("Memory")]
+        public async Task Test30_TimeWheel_GarbageCollection_ShouldFreeRamAfterTTL()
+        {
+            // Báo cho NUnit biết test này có thể chạy hơi lâu (vì chờ TimeWheel 10s)
+            var waitHandle = new ManualResetEventSlim(false);
+
+            _server.OnMessage<StringValue>("GC_Test", data => { waitHandle.Set(); });
+
+            await Task.Delay(500);
+
+            long initialCacheSize = _server.Trigger.CurrentDedupCacheSize;
+            long initialExpiredCount = _server.Trigger.TotalDedupExpired;
+
+            // Bắn 1 gói tin
+            _clientA.Publish("GC_Test", new StringValue { Value = "Need_To_Be_Cleaned" });
+
+            // Đợi Server nhận được
+            waitHandle.Wait(TimeSpan.FromSeconds(2));
+
+            // Ngay sau khi nhận, CacheSize phải tăng lên ít nhất 1
+            Assert.That(_server.Trigger.CurrentDedupCacheSize, Is.GreaterThan(initialCacheSize),
+                "Gói tin không được đưa vào Cache chống trùng lặp.");
+
+            Console.WriteLine($"[Test 30] Đang chờ 11 giây để TimeWheel dọn rác...");
+
+            // Cố tình chờ 11 giây (Vượt quá 10 giây TTL của Time Wheel)
+            await Task.Delay(11_000);
+
+            // Kiểm tra lại Trigger
+            long finalCacheSize = _server.Trigger.CurrentDedupCacheSize;
+            long finalExpiredCount = _server.Trigger.TotalDedupExpired;
+
+            Assert.That(finalCacheSize, Is.EqualTo(initialCacheSize),
+                "Lỗi Rò Rỉ Bộ Nhớ (Memory Leak)! Time Wheel KHÔNG xóa ID cũ.");
+            Assert.That(finalExpiredCount, Is.GreaterThan(initialExpiredCount),
+                "Trigger TotalDedupExpired không ghi nhận số lượng giải phóng.");
+
+            Console.WriteLine($"[Test 30] TimeWheel hoạt động hoàn hảo. Đã giải phóng thành công!");
+        }
+
+        /// <summary>
+        /// Kịch bản 31: Massive Fan-out (Phân phối diện rộng từ Server)
+        /// Server gửi 1 loạt tin nhắn cho nhiều Client ở các Region khác nhau cùng lúc.
+        /// Đảm bảo hệ thống định tuyến (Routing) không bị nhầm lẫn giữa các Client.
+        /// </summary>
+        [Test]
+        [Category("Integration")]
+        public async Task Test31_ServerToClient_FanOut_ShouldRouteToCorrectRegions()
+        {
+            var waitHandleA = new ManualResetEventSlim(false);
+            var waitHandleB = new ManualResetEventSlim(false);
+
+            string msgA = null;
+            string msgB = null;
+
+            // Client A (VN-01) lắng nghe
+            _clientA.OnMessage<StringValue>("SystemAnnouncement", data =>
+            {
+                msgA = data.Value;
+                waitHandleA.Set();
+            });
+
+            // Client B (US-West) lắng nghe
+            _clientB.OnMessage<StringValue>("SystemAnnouncement", data =>
+            {
+                msgB = data.Value;
+                waitHandleB.Set();
+            });
+
+            await Task.Delay(500);
+
+            // Giả lập vòng lặp Game cho cả 2 Client
+            var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+            _ = Task.Run(async () =>
+            {
+                while (!cts.IsCancellationRequested)
+                {
+                    _clientA.Tick();
+                    _clientB.Tick();
+                    await Task.Delay(16);
+                }
+            });
+
+            // Act: Server xả thông báo riêng biệt cho từng Region
+            _server.Publish("SystemAnnouncement", "VN-01", new StringValue { Value = "BaoTri_VN" });
+            _server.Publish("SystemAnnouncement", "US-West", new StringValue { Value = "Maintenance_US" });
+
+            bool successA = waitHandleA.Wait(TimeSpan.FromSeconds(2));
+            bool successB = waitHandleB.Wait(TimeSpan.FromSeconds(2));
+
+            cts.Cancel();
+            // Assert
+            Assert.That(successA, Is.True, "Client A không nhận được thông báo");
+            Assert.That(successB, Is.True, "Client B không nhận được thông báo");
+            Assert.That(msgA, Is.EqualTo("BaoTri_VN"), "Client A nhận nhầm luồng dữ liệu của US-West");
+            Assert.That(msgB, Is.EqualTo("Maintenance_US"), "Client B nhận nhầm luồng dữ liệu của VN-01");
+        }
+
+        /// <summary>
+        /// Kịch bản 32: Slow Client (Client lười biếng / Tụt FPS)
+        /// Nếu Game bị lag/đơ, hàm Tick() không được gọi trong 2 giây, dữ liệu từ Server đẩy xuống
+        /// phải được xếp hàng an toàn trong ConcurrentQueue chứ không được vứt bỏ hay làm Crash RAM.
+        /// </summary>
+        [Test]
+        [Category("Reliability")]
+        public async Task Test32_ServerToClient_SlowClient_ShouldQueueMessagesSafely()
+        {
+            int totalMessages = 500;
+            int processCount = 0;
+
+            _clientA.OnMessage<Int32Value>("SpawnMonster", data => { processCount++; });
+
+            await Task.Delay(500);
+
+            // Act 1: Server xả đạn cực nhanh xuống Client
+            for (int i = 0; i < totalMessages; i++)
+            {
+                _server.Publish("SpawnMonster", "VN-01", new Int32Value { Value = i });
+            }
+
+            // Đợi 2 giây để mạng chuyển hết dữ liệu, nhưng TUYỆT ĐỐI KHÔNG GỌI TICK()
+            await Task.Delay(2000);
+
+            // Assert 1: Chắc chắn rắng callback chưa hề được chạy (Queue đang giữ hàng)
+            Assert.That(processCount, Is.EqualTo(0),
+                "Lỗi nghiêm trọng: Hàm Callback chạy ngoài Main Thread (Không thông qua Tick)!");
+
+            // Act 2: Game hết lag, Main Thread gọi Tick liên tục để xả Queue
+            // Lưu ý: Hàm Tick() của bạn xử lý tối đa 100 action mỗi lần gọi
+            for (int i = 0; i < 10; i++) // Gọi 10 lần x 100 = dư sức xả hết 500
+            {
+                _clientA.Tick();
+            }
+
+            // Assert 2: Queue phải xả chính xác 500 tin nhắn
+            Assert.That(processCount, Is.EqualTo(totalMessages), "Client bị rơi rớt dữ liệu khi Queue bị ùn ứ!");
+        }
+
+        /// <summary>
+        /// Kịch bản 33: Client Deduplication (Chống trùng lặp tại Client)
+        /// Giả lập mạng chập chờn, Server tưởng Client chưa nhận được nên cố tình gửi lại
+        /// gói tin cũ (cùng MessageId). Client phải chặn đứng sự trùng lặp này.
+        /// </summary>
+        [Test]
+        [Category("Reliability")]
+        public async Task Test33_ServerToClient_Deduplication_ShouldBlockDuplicatePushes()
+        {
+            int processCount = 0;
+
+            _clientA.OnMessage<StringValue>("RewardItem", data => { processCount++; });
+
+            await Task.Delay(500);
+
+            // Tự tay tạo ra một Batch giả mạo để kiểm soát MessageId tĩnh
+            string fixedMessageId = "SERVER_RETRY_MSG_001";
+            var batchMsg = new NatifyBatch();
+            var payload = new StringValue { Value = "Sword_Level_99" };
+
+            var (buffer, length) = NatifySerializer.Serialize(payload);
+            var exactData = new byte[length];
+            Array.Copy(buffer, exactData, length);
+            batchMsg.Payloads.Add(Google.Protobuf.ByteString.CopyFrom(exactData));
+
+            var (batchBuffer, batchLength) = NatifySerializer.Serialize(batchMsg);
+            var exactBatchData = new byte[batchLength];
+            Array.Copy(batchBuffer, exactBatchData, batchLength);
+
+            // Dùng kết nối NATS thô để đóng giả Server gửi tin cậy
+            var rawNats = new NATS.Client.Core.NatsConnection(new NATS.Client.Core.NatsOpts { Url = NatsUrl });
+            await rawNats.ConnectAsync();
+
+            // Lấy đúng Subject mà Client đang Listen
+            string subject = NatifyTopics.GetClientListenSubject("GameClient", "GameServer", "VN-01", "RewardItem");
+            var headers = new NATS.Client.Core.NatsHeaders { ["Natify-MsgId"] = fixedMessageId };
+
+            // Bắn 3 lần y hệt nhau
+            await rawNats.PublishAsync(subject, exactBatchData, headers: headers);
+            await rawNats.PublishAsync(subject, exactBatchData, headers: headers);
+            await rawNats.PublishAsync(subject, exactBatchData, headers: headers);
+
+            // Xả Tick()
+            var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            while (!cts.IsCancellationRequested)
+            {
+                _clientA.Tick();
+                await Task.Delay(16);
+            }
+
+            // Assert: Client chỉ được phép nhận Thanh Gươm Cấp 99 ĐÚNG 1 LẦN
+            Assert.That(processCount, Is.EqualTo(1),
+                "Client Deduplication bị lỗi! Người chơi đã nhận được vật phẩm nhân bản (Dupe Bug)!");
+            Assert.That(_clientA.Trigger.CurrentDedupCacheSize, Is.GreaterThanOrEqualTo(1),
+                "Cache tại Client không ghi nhận ID này.");
+
+            await rawNats.DisposeAsync();
+        }
+
+        /// <summary>
+        /// Kịch bản 34: Server Request Client Large Async Payload (Tải trọng lớn ngược chiều)
+        /// Server gọi RPC xuống Client, Client load một file Save game nặng 100KB (Bất đồng bộ) và trả về.
+        /// Đảm bảo cơ chế ReplyTo raw của Client hoạt động ổn định với file lớn.
+        /// </summary>
+        [Test]
+        [Category("Integration")]
+        public async Task Test34_ServerToClient_AsyncRPC_LargePayload_ShouldNotBreak()
+        {
+            string hugeSaveFile = new string('S', 100_000); // ~100KB Data
+
+            // Client đăng ký xử lý
+            _clientA.OnRequest<StringValue, StringValue>("UploadSaveData", async req =>
+            {
+                // Giả lập đọc file Save mất 200ms
+                await Task.Delay(200);
+                return new StringValue { Value = hugeSaveFile };
+            });
+
+            await Task.Delay(500);
+
+            // Game Loop cho Client
+            var cts = new CancellationTokenSource();
+            _ = Task.Run(async () =>
+            {
+                while (!cts.IsCancellationRequested)
+                {
+                    _clientA.Tick();
+                    await Task.Delay(16);
+                }
+            });
+
+            // Act: Server chủ động gọi xuống
+            var response = await _server.RequestAsync<StringValue, StringValue>(
+                "UploadSaveData",
+                "VN-01",
+                new StringValue { Value = "GiveMeYourSave" },
+                TimeSpan.FromSeconds(5));
+
+            cts.Cancel();
+
+            // Assert
+            Assert.That(response, Is.Not.Null, "Server bị Timeout khi chờ Client gửi File lớn.");
+            Assert.That(response.Value.Length, Is.EqualTo(100_000),
+                "Dữ liệu file Save gửi từ Client bị cắt xén hoặc hỏng!");
+        }
+
+        /// <summary>
+        /// Kịch bản 35: Throughput Server -> Client (Mở khóa tối đa CPU)
+        /// Bài test này gọi hàm Tick() liên tục không có độ trễ để đo tốc độ mạng NATS và tốc độ Deserialize Protobuf 
+        /// thuần túy khi truyền từ Server xuống Client.
+        /// </summary>
+        [Test]
+        [Category("Performance")]
+        public async Task Test35_ServerToClient_Throughput_UnrestrictedTick()
+        {
+            int totalMessages = 100_000;
+            int receivedCount = 0;
+            var waitHandle = new ManualResetEventSlim(false);
+
+            _clientA.OnMessage<Int32Value>("MassivePush", data =>
+            {
+                if (Interlocked.Increment(ref receivedCount) == totalMessages)
+                {
+                    waitHandle.Set();
+                }
+            });
+
+            await Task.Delay(500); // Warmup
+
+            // Luồng xả Tick liên tục không nghỉ (Không delay 16ms như 60 FPS)
+            var cts = new CancellationTokenSource();
+            _ = Task.Run(() =>
+            {
+                while (!cts.IsCancellationRequested)
+                {
+                    _clientA.Tick();
+                }
+            });
+
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+            // Act: Server xả 100k tin nhắn
+            _ = Task.Run(async () =>
+            {
+                for (int i = 0; i < totalMessages; i++)
+                {
+                    _server.Publish("MassivePush", "VN-01", new Int32Value { Value = i });
+
+                    // Nhường CPU mỗi 500 tin nhắn để tránh nghẽn Buffer mạng TCP của Server
+                    if (i % 500 == 0) await Task.Yield();
+                }
+            });
+
+            // Chờ tối đa 15 giây
+            bool success = waitHandle.Wait(TimeSpan.FromSeconds(15));
+            stopwatch.Stop();
+            cts.Cancel();
+
+            // Assert
+            Assert.That(success, Is.True, $"Timeout! Client chỉ xử lý được {receivedCount}/{totalMessages} tin nhắn.");
+
+            double seconds = stopwatch.Elapsed.TotalSeconds;
+            double mps = totalMessages / seconds;
+
+            Console.WriteLine(
+                $"[Test 35] Server -> Client 100k tin nhắn trong {seconds:F3}s. Tốc độ thực: {mps:N0} MPS.");
+            Assert.That(mps, Is.GreaterThan(5000), "Tốc độ xử lý của Client quá chậm!");
+        }
+
+        /// <summary>
+        /// Kịch bản 36: Mô phỏng nghẽn cổ chai Unity 60 FPS (Real-world Simulation)
+        /// Nếu Unity chỉ chạy 60 FPS (xử lý max 6000 msg/s), luồng nền NATS sẽ nhận toàn bộ 100k tin nhắn cực nhanh 
+        /// và nhét vào ConcurrentQueue. Bài test này kiểm chứng Queue có bị tràn hoặc văng lỗi khi bị nhồi 100k Action không.
+        /// </summary>
+        [Test]
+        [Category("Performance")]
+        public async Task Test36_ServerToClient_60FPS_QueueStressTest()
+        {
+            int totalMessages = 100_000;
+            int receivedCount = 0;
+            var waitHandle = new ManualResetEventSlim(false);
+
+            _clientA.OnMessage<Int32Value>("StressTest60FPS", data =>
+            {
+                if (Interlocked.Increment(ref receivedCount) == totalMessages)
+                {
+                    waitHandle.Set();
+                }
+            });
+
+            await Task.Delay(500);
+
+            // Giả lập Game Loop 60 FPS (Chờ 16ms mỗi Frame)
+            var cts = new CancellationTokenSource();
+            _ = Task.Run(async () =>
+            {
+                while (!cts.IsCancellationRequested)
+                {
+                    _clientA.Tick(); // Chỉ xử lý 100 action mỗi lần
+                    await Task.Delay(16); // 60 FPS
+                }
+            });
+
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+            // Server đẩy 100k tin cực nhanh
+            _ = Task.Run(async () =>
+            {
+                for (int i = 0; i < totalMessages; i++)
+                {
+                    _server.Publish("StressTest60FPS", "VN-01", new Int32Value { Value = i });
+                    if (i % 500 == 0) await Task.Yield();
+                }
+            });
+
+            // CHÚ Ý: Vì Tick() bị kìm hãm ở 6000 msg/s, nên bắt buộc phải đợi ít nhất ~17 giây. 
+            // Ta set Timeout là 30 giây để an toàn.
+            bool success = waitHandle.Wait(TimeSpan.FromSeconds(30));
+            stopwatch.Stop();
+            cts.Cancel();
+
+            Assert.That(success, Is.True,
+                $"Timeout! Game Loop 60 FPS không thể tiêu hóa kịp. Bị kẹt ở {receivedCount}/{totalMessages}.");
+            Console.WriteLine(
+                $"[Test 36] Xả thành công 100k tin nhắn ở 60 FPS. Mất {stopwatch.Elapsed.TotalSeconds:F2} giây để xử lý hết Queue.");
+        }
+
+        /// <summary>
+        /// Kịch bản 37: Server -> Client Memory Leak Check
+        /// Khi Client nhận 100k tin nhắn, nó phải giải nén Batch, phân bổ RAM cho Protobuf, check Cache Dedup.
+        /// Đảm bảo GC không bị bóp nghẹt.
+        /// </summary>
+        [Test]
+        [Category("Performance")]
+        public async Task Test37_ServerToClient_Memory_ShouldNotSpike()
+        {
+            int totalMessages = 100_000;
+            var waitHandle = new ManualResetEventSlim(false);
+            int received = 0;
+
+            _clientA.OnMessage<Int32Value>("MemCheck", data =>
+            {
+                if (Interlocked.Increment(ref received) == totalMessages)
+                    waitHandle.Set();
+            });
+
+            await Task.Delay(500);
+
+            // Dọn rác khởi điểm
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            long initialMemory = GC.GetTotalMemory(false);
+            int initialGen0 = GC.CollectionCount(0);
+
+            var cts = new CancellationTokenSource();
+            _ = Task.Run(() =>
+            {
+                while (!cts.IsCancellationRequested) _clientA.Tick();
+            });
+
+            _ = Task.Run(async () =>
+            {
+                for (int i = 0; i < totalMessages; i++)
+                {
+                    _server.Publish("MemCheck", "VN-01", new Int32Value { Value = i });
+                    if (i % 500 == 0) await Task.Yield();
+                }
+            });
+
+            waitHandle.Wait(TimeSpan.FromSeconds(20));
+            cts.Cancel();
+
+            int finalGen0 = GC.CollectionCount(0);
+            long finalMemory = GC.GetTotalMemory(false);
+
+            int collectionsHappened = finalGen0 - initialGen0;
+            double memDiffMB = (finalMemory - initialMemory) / (1024.0 * 1024.0);
+
+            Console.WriteLine(
+                $"[Test 37] 100k Server->Client. GC Gen 0 chạy {collectionsHappened} lần. Chênh lệch RAM: {memDiffMB:F2} MB");
+
+            // Assert: Đảm bảo luồng Client giải phóng bộ nhớ (ArrayPool) tốt
+            Assert.That(collectionsHappened, Is.LessThan(20),
+                "Client bị quá tải rác (Garbage) khi phân giải Protobuf!");
+        }
+        
+        /// <summary>
+        /// Kịch bản 38: Endurance / Soak Test (Kiểm thử độ bền 5 phút)
+        /// Ép hệ thống chạy liên tục trong 5 phút.
+        /// Sử dụng thuật toán "Tổng cấp số cộng" để xác minh không rớt/không trùng lặp 
+        /// mà không cần dùng List/Dictionary (tránh làm sai lệch kết quả đo RAM).
+        /// </summary>
+        [Test]
+        [Category("Endurance")]
+        [Timeout(400_000)] // Cho phép Test chạy tối đa ~6.5 phút để tránh bị NUnit ép dừng
+        public async Task Test38_Endurance_5MinutesSoakTest_NoMemoryLeak_NoMessageLoss()
+        {
+            long receivedCount = 0;
+            long receivedSum = 0; // Dùng để checksum toàn vẹn dữ liệu
+            long sentCount = 0;
+
+            _clientA.OnMessage<Int32Value>("SoakTest", data => 
+            {
+                Interlocked.Increment(ref receivedCount);
+                Interlocked.Add(ref receivedSum, data.Value);
+            });
+
+            await Task.Delay(500); // Warmup
+
+            // Ép dọn rác trước khi bắt đầu để có điểm mốc RAM sạch nhất
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            long initialMemoryMB = GC.GetTotalMemory(true) / (1024 * 1024);
+
+            // 1. Khởi động Game Loop của Client (Cho phép xả max tốc độ)
+            var cts = new CancellationTokenSource();
+            _ = Task.Run(() => 
+            {
+                while (!cts.IsCancellationRequested)
+                {
+                    _clientA.Tick();
+                }
+            });
+
+            Console.WriteLine($"[Test 38] Bắt đầu Soak Test 5 phút. RAM ban đầu: {initialMemoryMB} MB");
+
+            var duration = TimeSpan.FromMinutes(5);
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            var lastReportTime = stopwatch.Elapsed;
+
+            // 2. Act: Vòng lặp bắn tin nhắn liên tục trong 5 phút
+            _ = Task.Run(async () => 
+            {
+                while (stopwatch.Elapsed < duration)
+                {
+                    // Bắn từng tin một, Server sẽ tự gom Batch ngầm
+                    _server.Publish("SoakTest", "VN-01", new Int32Value { Value = (int)sentCount });
+                    sentCount++;
+
+                    // Nhường luồng mỗi 1000 tin để tránh CPU bị ngộp 100% gây đứt kết nối NATS
+                    if (sentCount % 1000 == 0) 
+                    {
+                        await Task.Yield(); 
+                    }
+                }
+            });
+
+            // Vòng lặp chính in Log báo cáo mỗi 30 giây để biết Test chưa bị treo
+            while (stopwatch.Elapsed < duration)
+            {
+                if (stopwatch.Elapsed - lastReportTime > TimeSpan.FromSeconds(30))
+                {
+                    long currentMem = GC.GetTotalMemory(false) / (1024 * 1024);
+                    Console.WriteLine($"[Soak Test] Đang chạy... Đã gửi: {sentCount:N0} | Đã nhận: {Interlocked.Read(ref receivedCount):N0} | RAM: {currentMem} MB");
+                    lastReportTime = stopwatch.Elapsed;
+                }
+                await Task.Delay(1000);
+            }
+
+            // 3. Kết thúc thời gian bắn: Chờ Client tiêu hóa nốt dữ liệu còn đọng trên mạng
+            Console.WriteLine($"[Test 38] Đã hết 5 phút bắn đạn. Chờ Client xử lý nốt hàng tồn...");
+            
+            // Đợi tối đa 30 giây cho luồng nhận bắt kịp luồng gửi
+            var catchUpWaitTime = DateTime.UtcNow;
+            while (Interlocked.Read(ref receivedCount) < sentCount && (DateTime.UtcNow - catchUpWaitTime).TotalSeconds < 30)
+            {
+                await Task.Delay(100);
+            }
+
+            stopwatch.Stop();
+            cts.Cancel(); // Dừng Game Loop
+
+            // 4. Đo đạc lại RAM
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            long finalMemoryMB = GC.GetTotalMemory(true) / (1024 * 1024);
+            long memoryGrowth = finalMemoryMB - initialMemoryMB;
+
+            // 5. Assert: KIỂM TOÁN DỮ LIỆU
+            long finalReceivedCount = Interlocked.Read(ref receivedCount);
+            long finalReceivedSum = Interlocked.Read(ref receivedSum);
+            
+            // Công thức tổng cấp số cộng: S = n * (n - 1) / 2 (Vì đếm từ 0)
+            long expectedSum = (sentCount - 1) * sentCount / 2;
+
+            Console.WriteLine("=============================================");
+            Console.WriteLine($"[KẾT QUẢ SOAK TEST 5 PHÚT]");
+            Console.WriteLine($"- Gửi đi : {sentCount:N0} tin nhắn");
+            Console.WriteLine($"- Nhận về: {finalReceivedCount:N0} tin nhắn");
+            Console.WriteLine($"- Tăng trưởng RAM: {memoryGrowth} MB");
+            Console.WriteLine("=============================================");
+
+            // Khẳng định 1: Không mất tin nhắn
+            Assert.That(finalReceivedCount, Is.EqualTo(sentCount), "CÓ SỰ CỐ MẤT TIN NHẮN (Packet Loss)!");
+
+            // Khẳng định 2: Dữ liệu chính xác tuyệt đối, không trùng lặp (Dupe), không biến dạng
+            Assert.That(finalReceivedSum, Is.EqualTo(expectedSum), "DỮ LIỆU BỊ SAI LỆCH! Có thể Deduplication hỏng hoặc Data bị corrupt.");
+
+            // Khẳng định 3: Không rò rỉ bộ nhớ (Memory Leak)
+            // Trong C#, RAM dao động vài chục MB là bình thường do các buffer nội bộ của NATS.
+            // Nhưng nếu tăng hơn 100MB nghĩa là có rác không được giải phóng.
+            Assert.That(memoryGrowth, Is.LessThan(100), $"NGHI VẤN MEMORY LEAK! RAM tăng quá cao ({memoryGrowth} MB).");
         }
     }
 }
