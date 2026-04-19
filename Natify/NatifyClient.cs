@@ -36,6 +36,9 @@ namespace Natify
         private readonly int _maxRetries = 10;
         private Task _batchWorkerTask;
 
+        private Task _retryWorkerTask;
+        private Task _ackListenerTask;
+
         private readonly ConcurrentDictionary<string, byte> _processedMessages;
         private readonly TimedSortedSet<string, byte> _messageTtlWheel;
 
@@ -200,7 +203,7 @@ namespace Natify
         {
             // 1. Lắng nghe ACK từ Server
             string ackSubject = $"NatifyClient.{_clientName}.{_serverNameToConnect}.{_regionId}.ACK.*";
-            _ = Task.Run(async () =>
+            _ackListenerTask = Task.Run(async () =>
             {
                 await foreach (var msg in _connection.SubscribeAsync<byte[]>(ackSubject, cancellationToken: _cts.Token))
                 {
@@ -214,7 +217,7 @@ namespace Natify
             });
 
             // 2. Vòng lặp ngầm kiểm tra và Gửi lại (Retry)
-            _ = Task.Run(async () =>
+            _retryWorkerTask = Task.Run(async () =>
             {
                 while (!_cts.IsCancellationRequested)
                 {
@@ -527,15 +530,10 @@ namespace Natify
             if (_isDisposed) return;
             _isDisposed = true;
 
-            Trigger.Dispose();
-
             // BƯỚC 1: Khóa van đầu vào - Từ chối mọi lệnh Publish mới
-            // (Luồng ngầm BatchWorker vẫn đang chạy bình thường)
             _batchChannel.Writer.Complete();
 
-            // BƯỚC 2: Chờ luồng ngầm xả nốt hàng tồn kho
-            // Khi Channel trống rỗng, WaitToReadAsync sẽ tự động trả về false và kết thúc.
-            // Đặt timeout 2 giây để tránh treo Game/App nếu bị lỗi mạng không gửi được.
+            // BƯỚC 2: Chờ luồng ngầm gom nốt Batch và đẩy xuống TCP
             if (_batchWorkerTask != null)
             {
                 try
@@ -544,11 +542,18 @@ namespace Natify
                 }
                 catch
                 {
-                    /* Bỏ qua nếu có lỗi trong quá trình xả nốt */
                 }
             }
 
-            // BƯỚC 3: Bây giờ mới sập cầu dao (Hủy Token) để dừng các luồng Lắng nghe (Subscribe)
+            // BƯỚC 3 [QUAN TRỌNG]: Chờ nhận ACK cho các gói tin cuối cùng (Y hệt Server)
+            // Đảm bảo những tin nhắn Client vừa xả ở Bước 2 được Server xác nhận
+            var waitStartTime = DateTime.UtcNow;
+            while ((!_unackedMessages.IsEmpty) && (DateTime.UtcNow - waitStartTime).TotalSeconds < 2)
+            {
+                Thread.Sleep(50);
+            }
+
+            // BƯỚC 4: Sập cầu dao (Hủy Token) để ngắt các vòng lặp while/foreach
             try
             {
                 _cts.Cancel();
@@ -557,7 +562,23 @@ namespace Natify
             {
             }
 
-            // BƯỚC 4: Ngắt kết nối NATS
+            // BƯỚC 5: Đợi các luồng nền Retry và ACK Listener tắt hẳn
+            try
+            {
+                var tasksToWait = new List<Task>();
+                if (_retryWorkerTask != null) tasksToWait.Add(_retryWorkerTask);
+                if (_ackListenerTask != null) tasksToWait.Add(_ackListenerTask);
+
+                if (tasksToWait.Count > 0)
+                    Task.WaitAll(tasksToWait.ToArray(), TimeSpan.FromSeconds(1));
+            }
+            catch
+            {
+            }
+
+            // BƯỚC 6: Giải phóng tài nguyên, cắt mạng
+            Trigger.Dispose();
+
             try
             {
                 _connection.DisposeAsync().AsTask().GetAwaiter().GetResult();
@@ -565,6 +586,10 @@ namespace Natify
             catch
             {
             }
+
+            // BƯỚC 7 [VÁ MEMORY LEAK]: Dọn dẹp Time Wheel
+            _messageTtlWheel.OnExpired -= OnMessagesExpired;
+            _messageTtlWheel.Dispose();
 
             _cts.Dispose();
         }
