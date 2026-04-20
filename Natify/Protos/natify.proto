@@ -4,4 +4,8 @@ package Natify;
 // Gói này dùng để bọc nhiều Payload lại với nhau
 message NatifyBatch {
   repeated bytes payloads = 1;
+  repeated string reqId = 2;
+  repeated string msgType = 3;
+  repeated string repId = 4;
+  string formInstanceId = 5;
 }

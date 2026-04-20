@@ -1,12 +1,13 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
 using Google.Protobuf;
 using NATS.Client.Core;
+
+#nullable enable
 
 #if UNITY_5_3_OR_NEWER
 using UnityEngine;
@@ -14,15 +15,6 @@ using UnityEngine;
 
 namespace Natify
 {
-    public class UnackedMessage
-    {
-        public string Subject { get; set; }
-        public byte[] Payload { get; set; }
-        public string MessageId { get; set; }
-        public DateTime LastSent { get; set; }
-        public int RetryCount { get; set; }
-    }
-
     public class NatifyClient : IDisposable
     {
         private readonly ConcurrentDictionary<string, UnackedMessage> _unackedMessages = new();
@@ -32,6 +24,7 @@ namespace Natify
         private readonly string _groupName;
         private readonly string _regionId;
         private readonly string _serverNameToConnect;
+        private readonly string _instanceId;
         private bool _isDisposed = false;
         private readonly int _maxRetries = 10;
         private Task _batchWorkerTask;
@@ -42,14 +35,18 @@ namespace Natify
         private readonly ConcurrentDictionary<string, byte> _processedMessages;
         private readonly TimedSortedSet<string, byte> _messageTtlWheel;
 
+        private readonly ConcurrentDictionary<string, (TaskCompletionSource<byte[]> task, CancellationTokenSource ct)>
+            _replyTasks = new();
+
         public NatifyClientTriggers Trigger { get; } = new();
 
         private const int MaxCount = 1000;
         private const int MaxSize = 50 * 1024; // 50 KB
         private readonly TimeSpan MaxWait = TimeSpan.FromMilliseconds(50);
 
-        private readonly Channel<(string Subject, byte[] Payload)> _batchChannel =
-            Channel.CreateUnbounded<(string, byte[])>();
+        private readonly Channel<(string Subject, byte[] Payload, string MessageType, string ReqId, string RepId)>
+            _batchChannel =
+                Channel.CreateUnbounded<(string, byte[], string, string, string)>();
 
         private readonly CancellationTokenSource _cts;
         private readonly ConcurrentQueue<Action> _mainThreadActions = new();
@@ -61,6 +58,7 @@ namespace Natify
             _groupName = groupName;
             _regionId = regionId;
             _serverNameToConnect = serverNameToConnect;
+            _instanceId = Guid.NewGuid().ToString("N");
 
             _processedMessages = new ConcurrentDictionary<string, byte>();
             _messageTtlWheel = new TimedSortedSet<string, byte>();
@@ -80,6 +78,7 @@ namespace Natify
             // Khởi chạy luồng ngầm an toàn (thay thế cho Thread truyền thống gây cảnh báo)
             StartReliableFeatures();
             StartBatchWorker();
+            OnMessageRep();
         }
 
         private void OnMessagesExpired(IReadOnlyList<(string Key, byte Value)> expiredItems)
@@ -132,6 +131,10 @@ namespace Natify
 
                         // Gom vào lô
                         batch.Payloads.Add(ByteString.CopyFrom(item.Payload));
+                        batch.ReqId.Add(item.ReqId);
+                        batch.MsgType.Add(item.MessageType);
+                        batch.RepId.Add(item.RepId);
+                        batch.FormInstanceId = _instanceId;
 
                         // Cập nhật bộ đếm
                         currentCount++;
@@ -169,7 +172,8 @@ namespace Natify
                     {
                         string subject = kvp.Key;
                         NatifyBatch batchMsg = kvp.Value;
-                        string messageId = Guid.NewGuid().ToString("N");
+
+                        string batchId = Guid.NewGuid().ToString("N");
 
                         var (buffer, length) = NatifySerializer.Serialize(batchMsg);
                         var exactData = new byte[length];
@@ -183,14 +187,14 @@ namespace Natify
                         {
                             Subject = subject,
                             Payload = exactData,
-                            MessageId = messageId,
+                            BatchId = batchId,
                             LastSent = DateTime.UtcNow,
                             RetryCount = 0
                         };
 
-                        _unackedMessages.TryAdd(messageId, unackedMsg);
+                        _unackedMessages.TryAdd(batchId, unackedMsg);
 
-                        var headers = new NatsHeaders { ["Natify-MsgId"] = messageId };
+                        var headers = new NatsHeaders { ["Natify-BatchId"] = batchId };
                         await _connection.PublishAsync(subject, exactData, headers: headers,
                             cancellationToken: _cts.Token);
                     }
@@ -229,7 +233,7 @@ namespace Natify
                         {
                             if (unacked.RetryCount >= _maxRetries)
                             {
-                                LogError($"[NatifyClient] Drop gói tin {unacked.MessageId} vì vượt quá số lần Retry.");
+                                LogError($"[NatifyClient] Drop gói tin {unacked.BatchId} vì vượt quá số lần Retry.");
                                 _unackedMessages.TryRemove(kvp.Key, out _);
                                 continue;
                             }
@@ -238,7 +242,7 @@ namespace Natify
                             unacked.LastSent = DateTime.UtcNow;
                             unacked.RetryCount++;
 
-                            var headers = new NatsHeaders { ["Natify-MsgId"] = unacked.MessageId };
+                            var headers = new NatsHeaders { ["Natify-BatchId"] = unacked.BatchId };
                             await _connection.PublishAsync(unacked.Subject, unacked.Payload, headers: headers,
                                 cancellationToken: _cts.Token);
                         }
@@ -249,8 +253,14 @@ namespace Natify
             });
         }
 
-        public void Publish<T>(string topic, T message) where T : IMessage
+        public void Publish<T>(string topic, T message) where T : IMessage =>
+            Publish(topic, message, "PUB", out _, string.Empty);
+
+
+        private void Publish<T>(string topic, T message, string messageType, out string reqId, string repId)
+            where T : IMessage
         {
+            reqId = string.Empty;
             if (_isDisposed) return;
 
             string subject = NatifyTopics.GetClientPublishSubject(_serverNameToConnect, _clientName, _regionId, topic);
@@ -261,11 +271,13 @@ namespace Natify
             Array.Copy(buffer, exactData, length);
             System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
 
-            _batchChannel.Writer.TryWrite((subject, exactData));
+            reqId = Guid.NewGuid().ToString("N");
+
+            _batchChannel.Writer.TryWrite((subject, exactData, messageType, reqId, repId));
         }
 
         // Bỏ async void, thay bằng void và bọc Task bên trong
-        public void OnMessage<T>(string topic, Action<T> callback) where T : IMessage, new()
+        private void OnMessage(string topic, Action<Data<byte[]>>? callback, Func<Data<byte[]>, Task>? callbackAsync)
         {
             var subject = NatifyTopics.GetClientListenSubject(_clientName, _serverNameToConnect, _regionId, topic);
 
@@ -276,7 +288,7 @@ namespace Natify
                     await foreach (var msg in _connection.SubscribeAsync<byte[]>(subject, queueGroup: _groupName,
                                        cancellationToken: _cts.Token))
                     {
-                        msg.Headers?.TryGetValue("Natify-MsgId", out var messageId);
+                        msg.Headers?.TryGetValue("Natify-BatchId", out var messageId);
                         var payload = msg.Data ?? Array.Empty<byte>();
 
                         if (!string.IsNullOrEmpty(messageId))
@@ -293,12 +305,12 @@ namespace Natify
                             }
                             else
                             {
-                                continue; // Trùng lặp
+                                return;
                             }
                         }
 
                         // 1. Giải nén Batch ĐẠI DIỆN ở luồng ngầm
-                        NatifyBatch batch = null;
+                        NatifyBatch batch;
                         try
                         {
                             batch = NatifySerializer.Deserialize<NatifyBatch>(payload, payload.Length);
@@ -308,7 +320,7 @@ namespace Natify
                         {
                             Trigger.AddError();
                             LogError($"[NatifyClient] Error Parsing Batch: {ex.Message}");
-                            continue; // Lỗi thì bỏ qua
+                            return;
                         }
 
                         // 2. NHÉT NGUYÊN 1 LÔ VÀO QUEUE THAY VÌ TỪNG TIN NHẮN MỘT
@@ -317,11 +329,17 @@ namespace Natify
                         {
                             try
                             {
-                                foreach (var byteString in batch.Payloads)
+                                for (var i = 0; i < batch.Payloads.Count; i++)
                                 {
-                                    byte[] itemBytes = byteString.ToByteArray();
-                                    var data = NatifySerializer.Deserialize<T>(itemBytes, itemBytes.Length);
-                                    callback(data);
+                                    var itemBytes = batch.Payloads[i].ToByteArray();
+                                    var instanceId = batch.FormInstanceId;
+                                    var reqId = batch.ReqId[i];
+                                    var repId = batch.RepId[i];
+                                    // var data = NatifySerializer.Deserialize<T>(itemBytes, itemBytes.Length);
+                                    // callback.Invoke(new Data<T>(data, instanceId, repId));
+                                    var result = new Data<byte[]>(itemBytes, instanceId, reqId, repId);
+                                    callback?.Invoke(result);
+                                    if (callbackAsync != null) _ = callbackAsync(result);
                                 }
                             }
                             catch (Exception ex)
@@ -338,39 +356,56 @@ namespace Natify
             });
         }
 
+        private void OnMessageRep()
+        {
+            OnMessage($"Rep-{_instanceId}", data =>
+            {
+                if (_replyTasks.TryRemove(data.RepId, out var task))
+                {
+                    task.task.SetResult(data.Value);
+                    task.ct.Dispose();
+                }
+            }, null);
+        }
+
+        public void OnMessage<T>(string topic, Action<Data<T>> callback) where T : IMessage, new()
+        {
+            OnMessage(topic, data =>
+            {
+                var result = NatifySerializer.Deserialize<T>(data.Value, data.Value.Length);
+                callback(new Data<T>(result, data.InstanceId, data.ReqId, data.RepId));
+            }, null);
+        }
+
+        public void OnMessage<T>(string topic, Func<Data<T>, Task> callback) where T : IMessage, new()
+        {
+            OnMessage(topic, null, async data =>
+            {
+                var result = NatifySerializer.Deserialize<T>(data.Value, data.Value.Length);
+                await callback(new Data<T>(result, data.InstanceId, data.ReqId, data.RepId));
+            });
+        }
+
         public async Task<TRes> RequestAsync<TReq, TRes>(string topic, TReq requestData, TimeSpan timeout)
             where TReq : IMessage
             where TRes : IMessage, new()
         {
             if (_isDisposed) throw new ObjectDisposedException(nameof(NatifyClient));
 
-            var subject = NatifyTopics.GetClientPublishSubject(_serverNameToConnect, _clientName, _regionId, topic);
-            var (reqBuffer, reqLength) = NatifySerializer.Serialize(requestData);
-
-            var exactPayload = new byte[reqLength];
-            Array.Copy(reqBuffer, exactPayload, reqLength);
-            System.Buffers.ArrayPool<byte>.Shared.Return(reqBuffer);
-
-            try
+            Publish(topic, requestData, "REQ", out var reqId, string.Empty);
+            if (!string.IsNullOrEmpty(reqId))
             {
-                var reply = await _connection.RequestAsync<byte[], byte[]>(
-                    subject, exactPayload,
-                    replyOpts: new NatsSubOpts { Timeout = timeout },
-                    cancellationToken: _cts.Token);
+                var cancellationTokenSource = new CancellationTokenSource();
+                cancellationTokenSource.CancelAfter(timeout);
+                var taskCompletionSource = new TaskCompletionSource<byte[]>();
+                _replyTasks[reqId] = (taskCompletionSource, cancellationTokenSource);
 
-                var replyPayload = reply.Data ?? Array.Empty<byte>();
-                return NatifySerializer.Deserialize<TRes>(replyPayload, replyPayload.Length);
+                var result = await taskCompletionSource.Task;
+                var t = NatifySerializer.Deserialize<TRes>(result, result.Length);
+                return t;
             }
-            catch (NatsNoReplyException)
-            {
-                throw new TimeoutException(
-                    $"Request trên topic '{topic}' đã bị Timeout sau {timeout.TotalMilliseconds}ms.");
-            }
-            catch (NatsNoRespondersException) // THÊM DÒNG NÀY VÀO ĐÂY
-            {
-                throw new TimeoutException(
-                    $"Nhanh: Không có Server nào đang lắng nghe topic '{topic}'. Request bị Timeout lập tức.");
-            }
+
+            throw new Exception($"[NatifyClient] Request Failed: {reqId}");
         }
 
         // <summary>
@@ -380,57 +415,10 @@ namespace Natify
             where TReq : IMessage, new()
             where TRep : IMessage
         {
-            var subject = NatifyTopics.GetClientListenSubject(_clientName, _serverNameToConnect, _regionId, topic);
-
-            _ = Task.Run(async () =>
+            OnMessage<TReq>(topic, tReq =>
             {
-                try
-                {
-                    await foreach (var msg in _connection.SubscribeAsync<byte[]>(subject, queueGroup: _groupName,
-                                       cancellationToken: _cts.Token))
-                    {
-                        // Bỏ qua nếu không có hòm thư trả lời (Không phải Request)
-                        if (string.IsNullOrEmpty(msg.ReplyTo)) continue;
-
-                        // Lưu lại ReplyTo ngay lập tức vì msg có thể bị NATS thu hồi
-                        string replyTo = msg.ReplyTo;
-                        var payload = msg.Data ?? Array.Empty<byte>();
-
-                        // Đẩy vào Queue để Unity Tick() xử lý an toàn trên Main Thread
-                        _mainThreadActions.Enqueue(() =>
-                        {
-                            try
-                            {
-                                // 1. Giải mã Request
-                                var requestData = NatifySerializer.Deserialize<TReq>(payload, payload.Length);
-
-                                // 2. Chạy logic Game của bạn (An toàn gọi Unity API ở đây)
-                                TRep replyData = handler(requestData);
-
-                                // 3. Mã hóa kết quả
-                                var (replyBuffer, replyLength) = NatifySerializer.Serialize(replyData);
-                                var exactReplyData = new byte[replyLength];
-                                Array.Copy(replyBuffer, exactReplyData, replyLength);
-                                System.Buffers.ArrayPool<byte>.Shared.Return(replyBuffer);
-
-                                // 4. Bắn trả kết quả cho Server (Fire and forget để không kẹt Main Thread)
-                                _ = _connection.PublishAsync(replyTo, exactReplyData).AsTask();
-                            }
-                            catch (Exception ex)
-                            {
-                                LogError($"[NatifyClient] OnRequest Error on {topic}: {ex.Message}");
-                            }
-                        });
-                    }
-                }
-                catch (OperationCanceledException)
-                {
-                    /* Client đóng */
-                }
-                catch (Exception ex)
-                {
-                    LogError($"[NatifyClient] Subscribe Request Error: {ex.Message}");
-                }
+                var result = handler(tReq.Value);
+                Publish($"Rep-{_instanceId}", result, "REP", out var reqId, tReq.ReqId);
             });
         }
 
@@ -441,65 +429,11 @@ namespace Natify
             where TReq : IMessage, new()
             where TRep : IMessage
         {
-            var subject = NatifyTopics.GetClientListenSubject(_clientName, _serverNameToConnect, _regionId, topic);
-
-            _ = Task.Run(async () =>
+            OnMessage<TReq>(topic, async tReq =>
             {
-                try
-                {
-                    await foreach (var msg in _connection.SubscribeAsync<byte[]>(subject, queueGroup: _groupName,
-                                       cancellationToken: _cts.Token))
-                    {
-                        if (string.IsNullOrEmpty(msg.ReplyTo)) continue;
-
-                        string replyTo = msg.ReplyTo;
-                        var payload = msg.Data ?? Array.Empty<byte>();
-
-                        _mainThreadActions.Enqueue(() =>
-                        {
-                            // Bắt đầu thực thi Task bất đồng bộ trên Main Thread một cách an toàn
-                            // Không dùng 'async void' ở đây để tránh crash app nếu user code có lỗi
-                            _ = ProcessClientAsyncRequest(topic, replyTo, payload, handlerAsync);
-                        });
-                    }
-                }
-                catch (OperationCanceledException)
-                {
-                }
-                catch (Exception ex)
-                {
-                    LogError($"[NatifyClient] Subscribe Async Request Error on {topic}: {ex.Message}");
-                }
+                var result = await handlerAsync(tReq.Value);
+                Publish($"Rep-{_instanceId}", result, "REP", out var reqId, tReq.ReqId);
             });
-        }
-
-        // Hàm Helper để xử lý vòng đời của một Async Request
-        private async Task ProcessClientAsyncRequest<TReq, TRep>(string topic, string replyTo, byte[] payload,
-            Func<TReq, Task<TRep>> handlerAsync)
-            where TReq : IMessage, new()
-            where TRep : IMessage
-        {
-            try
-            {
-                // 1. Giải mã Request
-                var requestData = NatifySerializer.Deserialize<TReq>(payload, payload.Length);
-
-                // 2. Chạy logic bất đồng bộ của Game (Hàm này sẽ bắt đầu chạy trên Main Thread)
-                TRep replyData = await handlerAsync(requestData);
-
-                // 3. Mã hóa kết quả
-                var (replyBuffer, replyLength) = NatifySerializer.Serialize(replyData);
-                var exactReplyData = new byte[replyLength];
-                Array.Copy(replyBuffer, exactReplyData, replyLength);
-                System.Buffers.ArrayPool<byte>.Shared.Return(replyBuffer);
-
-                // 4. Trả lời Server
-                await _connection.PublishAsync(replyTo, exactReplyData).AsTask();
-            }
-            catch (Exception ex)
-            {
-                LogError($"[NatifyClient] Async OnRequest Error on {topic}: {ex.Message}");
-            }
         }
 
         public void Tick()
@@ -510,18 +444,6 @@ namespace Natify
                 action.Invoke();
                 count++;
             }
-        }
-
-        private void LogCallbackException(string topic, Exception ex)
-        {
-            var st = new StackTrace(ex, true);
-            var userCodeFrame = st.GetFrame(0);
-            string fileName = userCodeFrame?.GetFileName() ?? "Unknown File";
-            int line = userCodeFrame?.GetFileLineNumber() ?? 0;
-
-            string errorMsg =
-                $"[Natify] Error in Callback of Topic '{topic}'\nFile: {fileName} (Line: {line})\nError: {ex.Message}";
-            LogError(errorMsg);
         }
 
         private void LogError(string message)

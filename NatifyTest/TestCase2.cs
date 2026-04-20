@@ -43,7 +43,7 @@ namespace Natify.Tests
             _server.OnMessage<StringValue>("PlayerJoin", data =>
             {
                 receivedRegion = data.regionId;
-                receivedMessage = data.data;
+                receivedMessage = data.data.Value;
                 waitHandle.Set();
             });
 
@@ -70,7 +70,7 @@ namespace Natify.Tests
             _clientA.OnMessage<Int32Value>("UpdateHealth", data =>
             {
                 processCount++;
-                Assert.That(data.Value, Is.EqualTo(100));
+                Assert.That(data.Value.Value, Is.EqualTo(100));
             });
 
             await Task.Delay(100);
@@ -100,14 +100,14 @@ namespace Natify.Tests
             // 1. Client setup hứng PONG
             _clientA.OnMessage<StringValue>("PONG_TOPIC", data =>
             {
-                if (data.Value == "Server_Acknowledged")
+                if (data.Value.Value == "Server_Acknowledged")
                     pongReceived.Set();
             });
 
             // 2. Server setup hứng PING và trả lời PONG
             _server.OnMessage<StringValue>("PING_TOPIC", incoming =>
             {
-                if (incoming.data.Value == "Hello_Server")
+                if (incoming.data.Value.Value == "Hello_Server")
                 {
                     var replyPayload = new StringValue { Value = "Server_Acknowledged" };
                     // Gửi trả đúng RegionId của người gửi
@@ -148,14 +148,14 @@ namespace Natify.Tests
             _server.OnMessage<Int32Value>("BulletFired", data =>
             {
                 // Nhận diện viên đạn mồi (Value = -1)
-                if (data.data.Value == -1)
+                if (data.data.Value.Value == -1)
                 {
                     isServerReady.Set(); // Báo cáo: Đường truyền đã kết nối 100%
                     return;
                 }
 
                 // Xử lý đạn thật
-                missingTracker[data.data.Value] = true;
+                missingTracker[data.data.Value.Value] = true;
                 int current = Interlocked.Increment(ref receivedCounter);
                 if (current == expectedMessages)
                 {
@@ -228,7 +228,7 @@ namespace Natify.Tests
 
             _server.OnMessage<StringValue>("SyncMapData", data =>
             {
-                receivedString = data.data.Value;
+                receivedString = data.data.Value.Value;
                 waitHandle.Set();
             });
 
@@ -423,7 +423,7 @@ namespace Natify.Tests
 
             _clientA.OnMessage<StringValue>("ResilienceTest", data =>
             {
-                validMessage = data;
+                validMessage = data.Value;
                 waitHandle.Set();
             });
 
@@ -720,7 +720,7 @@ namespace Natify.Tests
             {
                 lock (receivedList) // Lock để đảm bảo List an toàn khi add
                 {
-                    receivedList.Add(data.data.Value);
+                    receivedList.Add(data.data.Value.Value);
                     if (receivedList.Count == totalMessages) waitHandle.Set();
                 }
             });
@@ -755,7 +755,7 @@ namespace Natify.Tests
 
             _server.OnMessage<StringValue>("WorldChat", data =>
             {
-                receivedText = data.data.Value;
+                receivedText = data.data.Value.Value;
                 waitHandle.Set();
             });
 
@@ -842,7 +842,7 @@ namespace Natify.Tests
 
             _server.OnMessage<Int32Value>("ThroughputTest", data =>
             {
-                receivedTracker.TryAdd(data.data.Value, 1);
+                receivedTracker.TryAdd(data.data.Value.Value, 1);
 
                 if (Interlocked.Increment(ref receivedCount) == totalMessages)
                 {
@@ -1063,7 +1063,7 @@ namespace Natify.Tests
             await rawNats.ConnectAsync();
 
             string subject = NatifyTopics.GetClientPublishSubject("GameServer", "GameClient", "VN-01", "DedupTest");
-            var headers = new NATS.Client.Core.NatsHeaders { ["Natify-MsgId"] = fakeMessageId };
+            var headers = new NATS.Client.Core.NatsHeaders { ["Natify-BatchId"] = fakeMessageId };
 
             // Bắn 3 lần cùng 1 ID
             await rawNats.PublishAsync(subject, exactBatchData, headers: headers);
@@ -1194,14 +1194,14 @@ namespace Natify.Tests
             // Client A (VN-01) lắng nghe
             _clientA.OnMessage<StringValue>("SystemAnnouncement", data =>
             {
-                msgA = data.Value;
+                msgA = data.Value.Value;
                 waitHandleA.Set();
             });
 
             // Client B (US-West) lắng nghe
             _clientB.OnMessage<StringValue>("SystemAnnouncement", data =>
             {
-                msgB = data.Value;
+                msgB = data.Value.Value;
                 waitHandleB.Set();
             });
 
@@ -1309,7 +1309,7 @@ namespace Natify.Tests
 
             // Lấy đúng Subject mà Client đang Listen
             string subject = NatifyTopics.GetClientListenSubject("GameClient", "GameServer", "VN-01", "RewardItem");
-            var headers = new NATS.Client.Core.NatsHeaders { ["Natify-MsgId"] = fixedMessageId };
+            var headers = new NATS.Client.Core.NatsHeaders { ["Natify-BatchId"] = fixedMessageId };
 
             // Bắn 3 lần y hệt nhau
             await rawNats.PublishAsync(subject, exactBatchData, headers: headers);
@@ -1560,7 +1560,7 @@ namespace Natify.Tests
             Assert.That(collectionsHappened, Is.LessThan(20),
                 "Client bị quá tải rác (Garbage) khi phân giải Protobuf!");
         }
-        
+
         /// <summary>
         /// Kịch bản 38: Endurance / Soak Test (Kiểm thử độ bền 5 phút)
         /// Ép hệ thống chạy liên tục trong 5 phút.
@@ -1576,10 +1576,10 @@ namespace Natify.Tests
             long receivedSum = 0; // Dùng để checksum toàn vẹn dữ liệu
             long sentCount = 0;
 
-            _clientA.OnMessage<Int32Value>("SoakTest", data => 
+            _clientA.OnMessage<Int32Value>("SoakTest", data =>
             {
                 Interlocked.Increment(ref receivedCount);
-                Interlocked.Add(ref receivedSum, data.Value);
+                Interlocked.Add(ref receivedSum, data.Value.Value);
             });
 
             await Task.Delay(500); // Warmup
@@ -1592,7 +1592,7 @@ namespace Natify.Tests
 
             // 1. Khởi động Game Loop của Client (Cho phép xả max tốc độ)
             var cts = new CancellationTokenSource();
-            _ = Task.Run(() => 
+            _ = Task.Run(() =>
             {
                 while (!cts.IsCancellationRequested)
                 {
@@ -1607,7 +1607,7 @@ namespace Natify.Tests
             var lastReportTime = stopwatch.Elapsed;
 
             // 2. Act: Vòng lặp bắn tin nhắn liên tục trong 5 phút
-            _ = Task.Run(async () => 
+            _ = Task.Run(async () =>
             {
                 while (stopwatch.Elapsed < duration)
                 {
@@ -1616,9 +1616,9 @@ namespace Natify.Tests
                     sentCount++;
 
                     // Nhường luồng mỗi 1000 tin để tránh CPU bị ngộp 100% gây đứt kết nối NATS
-                    if (sentCount % 1000 == 0) 
+                    if (sentCount % 1000 == 0)
                     {
-                        await Task.Yield(); 
+                        await Task.Yield();
                     }
                 }
             });
@@ -1629,18 +1629,21 @@ namespace Natify.Tests
                 if (stopwatch.Elapsed - lastReportTime > TimeSpan.FromSeconds(30))
                 {
                     long currentMem = GC.GetTotalMemory(false) / (1024 * 1024);
-                    Console.WriteLine($"[Soak Test] Đang chạy... Đã gửi: {sentCount:N0} | Đã nhận: {Interlocked.Read(ref receivedCount):N0} | RAM: {currentMem} MB");
+                    Console.WriteLine(
+                        $"[Soak Test] Đang chạy... Đã gửi: {sentCount:N0} | Đã nhận: {Interlocked.Read(ref receivedCount):N0} | RAM: {currentMem} MB");
                     lastReportTime = stopwatch.Elapsed;
                 }
+
                 await Task.Delay(1000);
             }
 
             // 3. Kết thúc thời gian bắn: Chờ Client tiêu hóa nốt dữ liệu còn đọng trên mạng
             Console.WriteLine($"[Test 38] Đã hết 5 phút bắn đạn. Chờ Client xử lý nốt hàng tồn...");
-            
+
             // Đợi tối đa 30 giây cho luồng nhận bắt kịp luồng gửi
             var catchUpWaitTime = DateTime.UtcNow;
-            while (Interlocked.Read(ref receivedCount) < sentCount && (DateTime.UtcNow - catchUpWaitTime).TotalSeconds < 30)
+            while (Interlocked.Read(ref receivedCount) < sentCount &&
+                   (DateTime.UtcNow - catchUpWaitTime).TotalSeconds < 30)
             {
                 await Task.Delay(100);
             }
@@ -1658,7 +1661,7 @@ namespace Natify.Tests
             // 5. Assert: KIỂM TOÁN DỮ LIỆU
             long finalReceivedCount = Interlocked.Read(ref receivedCount);
             long finalReceivedSum = Interlocked.Read(ref receivedSum);
-            
+
             // Công thức tổng cấp số cộng: S = n * (n - 1) / 2 (Vì đếm từ 0)
             long expectedSum = (sentCount - 1) * sentCount / 2;
 
@@ -1673,7 +1676,8 @@ namespace Natify.Tests
             Assert.That(finalReceivedCount, Is.EqualTo(sentCount), "CÓ SỰ CỐ MẤT TIN NHẮN (Packet Loss)!");
 
             // Khẳng định 2: Dữ liệu chính xác tuyệt đối, không trùng lặp (Dupe), không biến dạng
-            Assert.That(finalReceivedSum, Is.EqualTo(expectedSum), "DỮ LIỆU BỊ SAI LỆCH! Có thể Deduplication hỏng hoặc Data bị corrupt.");
+            Assert.That(finalReceivedSum, Is.EqualTo(expectedSum),
+                "DỮ LIỆU BỊ SAI LỆCH! Có thể Deduplication hỏng hoặc Data bị corrupt.");
 
             // Khẳng định 3: Không rò rỉ bộ nhớ (Memory Leak)
             // Trong C#, RAM dao động vài chục MB là bình thường do các buffer nội bộ của NATS.

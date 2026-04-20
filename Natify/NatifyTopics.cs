@@ -9,20 +9,33 @@ namespace Natify
             return $"NatifyClient.{clientName}.{serverName}.{regionId}.{topic}";
         }
 
+        public static string GetClientReplySubject(string clientName, string serverName, string instanceId)
+        {
+            return $"NatifyClient.{clientName}.{serverName}.{instanceId}";
+        }
+
         public static string GetServerListenSubject(string serverName, string clientName, string topic)
         {
             return $"NatifyServer.{serverName}.{clientName}.*.{topic}";
         }
 
-        public static string GetClientPublishSubject(string serverName, string clientName, string regionId, string topic)
+        public static string GetServerReplySubject(string serverName, string clientName, string instanceId)
+        {
+            return $"NatifyServer.{serverName}.{clientName}.{instanceId}";
+        }
+
+        public static string GetClientPublishSubject(string serverName, string clientName, string regionId,
+            string topic)
         {
             return $"NatifyServer.{serverName}.{clientName}.{regionId}.{topic}";
         }
 
-        public static string GetServerPublishSubject(string clientName, string serverName, string regionId, string topic)
+        public static string GetServerPublishSubject(string clientName, string serverName, string regionId,
+            string topic)
         {
             return $"NatifyClient.{clientName}.{serverName}.{regionId}.{topic}";
         }
+
 
         public static string ExtractRegionIdFromServerSubject(string subject)
         {
