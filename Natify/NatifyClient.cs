@@ -277,7 +277,9 @@ namespace Natify
         }
 
         // Bỏ async void, thay bằng void và bọc Task bên trong
-        private void OnMessage(string topic, Action<Data<byte[]>>? callback, Func<Data<byte[]>, Task>? callbackAsync)
+// 1. Thêm tham số requiresMainThread = true
+        private void OnMessage(string topic, Action<Data<byte[]>>? callback, Func<Data<byte[]>, Task>? callbackAsync,
+            bool requiresMainThread = true)
         {
             var subject = NatifyTopics.GetClientListenSubject(_clientName, _serverNameToConnect, _regionId, topic);
 
@@ -288,7 +290,13 @@ namespace Natify
                     await foreach (var msg in _connection.SubscribeAsync<byte[]>(subject, queueGroup: _groupName,
                                        cancellationToken: _cts.Token))
                     {
-                        msg.Headers?.TryGetValue("Natify-BatchId", out var messageId);
+                        // SỬA LỖI 3: Trích xuất Header an toàn, chống lọt Deduplication
+                        string messageId = string.Empty;
+                        if (msg.Headers != null && msg.Headers.TryGetValue("Natify-BatchId", out var msgIdVal))
+                        {
+                            messageId = msgIdVal.ToString();
+                        }
+
                         var payload = msg.Data ?? Array.Empty<byte>();
 
                         if (!string.IsNullOrEmpty(messageId))
@@ -305,11 +313,10 @@ namespace Natify
                             }
                             else
                             {
-                                return;
+                                continue; // Đã xử lý rồi thì bỏ qua luôn
                             }
                         }
 
-                        // 1. Giải nén Batch ĐẠI DIỆN ở luồng ngầm
                         NatifyBatch batch;
                         try
                         {
@@ -320,12 +327,11 @@ namespace Natify
                         {
                             Trigger.AddError();
                             LogError($"[NatifyClient] Error Parsing Batch: {ex.Message}");
-                            return;
+                            continue; // SỬA LỖI 2: Dùng 'continue' thay vì 'return' để luồng không bị sập!
                         }
 
-                        // 2. NHÉT NGUYÊN 1 LÔ VÀO QUEUE THAY VÌ TỪNG TIN NHẮN MỘT
-                        // Nhờ vậy, 100,000 tin nhắn chỉ tốn 100 cục Action trong RAM!
-                        _mainThreadActions.Enqueue(() =>
+                        // Đóng gói hành động giải nén thành Action
+                        Action processBatch = () =>
                         {
                             try
                             {
@@ -335,8 +341,6 @@ namespace Natify
                                     var instanceId = batch.FormInstanceId;
                                     var reqId = batch.ReqId[i];
                                     var repId = batch.RepId[i];
-                                    // var data = NatifySerializer.Deserialize<T>(itemBytes, itemBytes.Length);
-                                    // callback.Invoke(new Data<T>(data, instanceId, repId));
                                     var result = new Data<byte[]>(itemBytes, instanceId, reqId, repId);
                                     callback?.Invoke(result);
                                     if (callbackAsync != null) _ = callbackAsync(result);
@@ -347,7 +351,17 @@ namespace Natify
                                 Trigger.AddError();
                                 LogError($"[NatifyClient] OnMessage Error on {topic}: {ex.Message}");
                             }
-                        });
+                        };
+
+                        // SỬA LỖI 1: Nếu là hệ thống (Rep), xả luôn. Nếu là Game logic, cho vào hàng đợi.
+                        if (requiresMainThread)
+                        {
+                            _mainThreadActions.Enqueue(processBatch);
+                        }
+                        else
+                        {
+                            processBatch(); // Chạy ngay lập tức không cần Tick()
+                        }
                     }
                 }
                 catch (OperationCanceledException)
@@ -356,6 +370,7 @@ namespace Natify
             });
         }
 
+// 2. Chỉnh lại hàm nghe Reply để tắt yêu cầu Main Thread
         private void OnMessageRep()
         {
             OnMessage($"Rep-{_instanceId}", data =>
@@ -365,16 +380,16 @@ namespace Natify
                     task.task.SetResult(data.Value);
                     task.ct.Dispose();
                 }
-            }, null);
+            }, null, false); // <--- QUAN TRỌNG: requiresMainThread = false
         }
-
+        
         public void OnMessage<T>(string topic, Action<Data<T>> callback) where T : IMessage, new()
         {
             OnMessage(topic, data =>
             {
                 var result = NatifySerializer.Deserialize<T>(data.Value, data.Value.Length);
                 callback(new Data<T>(result, data.InstanceId, data.ReqId, data.RepId));
-            }, null);
+            }, null, true);
         }
 
         public void OnMessage<T>(string topic, Func<Data<T>, Task> callback) where T : IMessage, new()
@@ -383,7 +398,7 @@ namespace Natify
             {
                 var result = NatifySerializer.Deserialize<T>(data.Value, data.Value.Length);
                 await callback(new Data<T>(result, data.InstanceId, data.ReqId, data.RepId));
-            });
+            }, true);
         }
 
         public async Task<TRes> RequestAsync<TReq, TRes>(string topic, TReq requestData, TimeSpan timeout)
@@ -396,8 +411,21 @@ namespace Natify
             if (!string.IsNullOrEmpty(reqId))
             {
                 var cancellationTokenSource = new CancellationTokenSource();
-                cancellationTokenSource.CancelAfter(timeout);
                 var taskCompletionSource = new TaskCompletionSource<byte[]>();
+
+                // --- ĐOẠN CODE CẦN THÊM CHO SERVER ---
+                cancellationTokenSource.Token.Register(() =>
+                {
+                    if (_replyTasks.TryRemove(reqId, out _))
+                    {
+                        // Ép Task ném ra TimeoutException khi hết giờ
+                        taskCompletionSource.TrySetException(new TimeoutException(
+                            $"[NatifyServer] Request {reqId} timed out after {timeout.TotalMilliseconds}ms."));
+                    }
+                });
+                // --- KẾT THÚC ---
+
+                cancellationTokenSource.CancelAfter(timeout);
                 _replyTasks[reqId] = (taskCompletionSource, cancellationTokenSource);
 
                 var result = await taskCompletionSource.Task;
@@ -418,7 +446,7 @@ namespace Natify
             OnMessage<TReq>(topic, tReq =>
             {
                 var result = handler(tReq.Value);
-                Publish($"Rep-{_instanceId}", result, "REP", out var reqId, tReq.ReqId);
+                Publish($"Rep-{tReq.InstanceId}", result, "REP", out var reqId, tReq.ReqId);
             });
         }
 
@@ -432,7 +460,7 @@ namespace Natify
             OnMessage<TReq>(topic, async tReq =>
             {
                 var result = await handlerAsync(tReq.Value);
-                Publish($"Rep-{_instanceId}", result, "REP", out var reqId, tReq.ReqId);
+                Publish($"Rep-{tReq.InstanceId}", result, "REP", out var reqId, tReq.ReqId);
             });
         }
 

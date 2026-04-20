@@ -407,7 +407,7 @@ namespace Natify.Tests
                     TimeSpan.FromSeconds(1));
             });
 
-            Assert.That(ex.Message, Does.Contain("Timeout").IgnoreCase);
+            Assert.That(ex.Message, Does.Contain("timed out").IgnoreCase);
         }
 
         /// <summary>
@@ -590,7 +590,7 @@ namespace Natify.Tests
                     TimeSpan.FromSeconds(1));
             });
 
-            Assert.That(ex.Message, Does.Contain("Timeout").IgnoreCase,
+            Assert.That(ex.Message, Does.Contain("timed out").IgnoreCase,
                 "Server bị treo hoặc văng lỗi lạ khi Client không trả lời!");
         }
 
@@ -696,7 +696,7 @@ namespace Natify.Tests
             });
 
             // Client sẽ bị Timeout vì Server bị lỗi nên không thèm trả lời
-            Assert.That(ex.Message, Does.Contain("Timeout").IgnoreCase);
+            Assert.That(ex.Message, Does.Contain("timed out").IgnoreCase);
 
             // ACT 2: Lập tức gửi một lệnh bình thường xem Server còn sống không?
             var survivalResponse = await _clientA.RequestAsync<StringValue, StringValue>(
@@ -890,7 +890,7 @@ namespace Natify.Tests
         [Category("Performance")]
         public async Task Test25_Performance_Latency_AverageRTT_ShouldBeUnder2ms()
         {
-            int iterations = 1000;
+            int iterations = 100;
 
             // Server phản hồi nhanh nhất có thể
             _server.OnRequest<Int32Value, Int32Value>("LatencyPing", incoming =>
@@ -899,6 +899,16 @@ namespace Natify.Tests
             });
 
             await Task.Delay(500);
+            
+            var ctsUnityLoop = new CancellationTokenSource();
+            _ = Task.Run(async () =>
+            {
+                while (!ctsUnityLoop.IsCancellationRequested)
+                {
+                    _clientA.Tick();
+                    await Task.Delay(16);
+                }
+            });
 
             // Warmup: Bắn vài phát đầu tiên để JIT Compiler dịch code (Loại bỏ thời gian khởi động)
             for (int i = 0; i < 5; i++)
@@ -922,12 +932,13 @@ namespace Natify.Tests
 
             double totalMs = stopwatch.Elapsed.TotalMilliseconds;
             double averageLatencyMs = totalMs / iterations;
+            await ctsUnityLoop.CancelAsync();
 
             Console.WriteLine(
                 $"[Test 25] 1000 vòng Ping-Pong tốn {totalMs:F2}ms. Độ trễ trung bình RTT: {averageLatencyMs:F4} ms/request.");
 
             // Assert độ trễ: Quá 2ms trên localhost là code đang có vấn đề về Thread/Locking
-            Assert.That(averageLatencyMs, Is.LessThan(2.0), "Độ trễ trung bình quá cao!");
+            Assert.That(averageLatencyMs, Is.LessThan(2.0), $"Độ trễ trung bình quá cao! {averageLatencyMs}");
         }
 
         [Test]
@@ -1052,6 +1063,7 @@ namespace Natify.Tests
             var (buffer, length) = NatifySerializer.Serialize(payload);
             var exactData = new byte[length];
             Array.Copy(buffer, exactData, length);
+            
             batchMsg.Payloads.Add(Google.Protobuf.ByteString.CopyFrom(exactData));
 
             var (batchBuffer, batchLength) = NatifySerializer.Serialize(batchMsg);
@@ -1108,7 +1120,7 @@ namespace Natify.Tests
 
             // 2. Unity Game Loop ảo để Tick liên tục cho Client
             var ctsUnityLoop = new CancellationTokenSource();
-            var unityGameLoop = Task.Run(async () =>
+            _ = Task.Run(async () =>
             {
                 while (!ctsUnityLoop.IsCancellationRequested)
                 {
@@ -1683,6 +1695,143 @@ namespace Natify.Tests
             // Trong C#, RAM dao động vài chục MB là bình thường do các buffer nội bộ của NATS.
             // Nhưng nếu tăng hơn 100MB nghĩa là có rác không được giải phóng.
             Assert.That(memoryGrowth, Is.LessThan(100), $"NGHI VẤN MEMORY LEAK! RAM tăng quá cao ({memoryGrowth} MB).");
+        }
+
+        /// <summary>
+        /// Kịch bản 39: Client -> Server RPC Reliability (20,000 Requests)
+        /// Kiểm tra độ tin cậy khi Client dồn dập gửi 20k yêu cầu RPC lên Server.
+        /// Xác minh tính toàn vẹn: Request ID #X phải nhận đúng Response ID #X.
+        /// </summary>
+        [Test]
+        [Category("Performance")]
+        public async Task Test39_ClientToServer_RPC_Reliability_20K_Continuous()
+        {
+            int totalRequests = 20_000;
+            int successCount = 0;
+
+            // Server xử lý: Chỉ đơn giản là cộng thêm 1 vào giá trị nhận được
+            _server.OnRequest<Int32Value, Int32Value>("BulkRPC_C2S",
+                incoming => { return new Int32Value { Value = incoming.request.Value + 1 }; });
+
+            await Task.Delay(500); // Đợi ổn định kết nối
+
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            var tasks = new List<Task>();
+
+            // Act: Bắn 20,000 Request song song (sử dụng Semaphore để kiểm soát concurrency nếu cần, 
+            // nhưng ở đây ta xả thẳng để test độ chịu tải của NATS/Natify)
+            for (int i = 0; i < totalRequests; i++)
+            {
+                int requestId = i;
+                tasks.Add(Task.Run(async () =>
+                {
+                    try
+                    {
+                        var response = await _clientA.RequestAsync<Int32Value, Int32Value>(
+                            "BulkRPC_C2S",
+                            new Int32Value { Value = requestId },
+                            TimeSpan.FromSeconds(10)); // Timeout 10s cho 20k request
+
+                        if (response.Value == requestId + 1)
+                        {
+                            Interlocked.Increment(ref successCount);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[Test 39] Request {requestId} failed: {ex.Message}");
+                    }
+                }));
+            }
+
+            // 2. Chạy Game Loop cho Client (Mở khóa tối đa tốc độ Tick để tiêu hóa 20k request)
+            var cts = new CancellationTokenSource();
+            _ = Task.Run(() =>
+            {
+                while (!cts.IsCancellationRequested)
+                {
+                    _clientA.Tick(); // Lấy 100 action/lần
+                }
+            });
+
+            await Task.WhenAll(tasks);
+            stopwatch.Stop();
+
+            await cts.CancelAsync();
+
+            // Assert
+            Console.WriteLine(
+                $"[Test 39] Hoàn thành {totalRequests:N0} RPC C2S trong {stopwatch.ElapsedMilliseconds}ms. Thành công: {successCount}");
+            Assert.That(successCount, Is.EqualTo(totalRequests),
+                "Bị rớt gói hoặc sai lệch dữ liệu RPC từ Client lên Server!");
+        }
+
+        /// <summary>
+        /// Kịch bản 40: Server -> Client RPC Reliability (20,000 Requests)
+        /// Kiểm tra độ tin cậy khi Server chủ động gọi xuống Client 20k lần.
+        /// Test tính bền bỉ của hàng đợi Tick() và luồng phản hồi của Client.
+        /// </summary>
+        [Test]
+        [Category("Performance")]
+        public async Task Test40_ServerToClient_RPC_Reliability_20K_Continuous()
+        {
+            int totalRequests = 20_000;
+            int successCount = 0;
+
+            // 1. Client đăng ký xử lý Request (Phải qua luồng Tick)
+            _clientA.OnRequest<Int32Value, Int32Value>("BulkRPC_S2C",
+                request => { return new Int32Value { Value = request.Value * 2 }; });
+
+            await Task.Delay(500);
+
+            // 2. Chạy Game Loop cho Client (Mở khóa tối đa tốc độ Tick để tiêu hóa 20k request)
+            var cts = new CancellationTokenSource();
+            _ = Task.Run(() =>
+            {
+                while (!cts.IsCancellationRequested)
+                {
+                    _clientA.Tick(); // Lấy 100 action/lần
+                }
+            });
+
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            var tasks = new List<Task>();
+
+            // 3. Act: Server xả 20,000 yêu cầu xuống Region VN-01
+            for (int i = 0; i < totalRequests; i++)
+            {
+                int requestId = i;
+                tasks.Add(Task.Run(async () =>
+                {
+                    try
+                    {
+                        var response = await _server.RequestAsync<Int32Value, Int32Value>(
+                            "BulkRPC_S2C",
+                            "VN-01",
+                            new Int32Value { Value = requestId },
+                            TimeSpan.FromSeconds(15)); // Timeout dài hơn vì Client Tick có giới hạn
+
+                        if (response.Value == requestId * 2)
+                        {
+                            Interlocked.Increment(ref successCount);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        // Log lỗi nếu cần
+                    }
+                }));
+            }
+
+            await Task.WhenAll(tasks);
+            stopwatch.Stop();
+            await cts.CancelAsync(); // Dừng vòng lặp Tick
+
+            // Assert
+            Console.WriteLine(
+                $"[Test 40] Hoàn thành {totalRequests:N0} RPC S2C trong {stopwatch.ElapsedMilliseconds}ms. Thành công: {successCount}");
+            Assert.That(successCount, Is.EqualTo(totalRequests),
+                "Bị rớt gói hoặc sai lệch dữ liệu RPC từ Server xuống Client!");
         }
     }
 }

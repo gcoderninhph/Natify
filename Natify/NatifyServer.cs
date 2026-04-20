@@ -169,7 +169,7 @@ namespace Natify
                         batch.MsgType.Add(item.MessageType);
                         batch.RepId.Add(item.RepId);
                         batch.FormInstanceId = _instanceId;
-                        
+
                         currentCount++;
                         currentSizeBytes += item.Payload.Length;
                     }
@@ -296,7 +296,11 @@ namespace Natify
                         var regionId = NatifyTopics.ExtractRegionIdFromServerSubject(msg.Subject);
 
                         // 1. Kiểm tra MessageId và Xử lý ACK (Cho nguyên cả 1 Batch)
-                        msg.Headers?.TryGetValue("Natify-BatchId", out var messageId);
+                        string messageId = string.Empty;
+                        if (msg.Headers != null && msg.Headers.TryGetValue("Natify-BatchId", out var msgIdVal))
+                        {
+                            messageId = msgIdVal.ToString();
+                        }
 
                         if (!string.IsNullOrEmpty(messageId))
                         {
@@ -304,20 +308,15 @@ namespace Natify
                                 $"NatifyClient.{_clientNameToConnect}.{_serverName}.{regionId}.ACK.{messageId}";
                             _ = _connection.PublishAsync(ackSubject, Array.Empty<byte>()).AsTask();
 
-                            // 2. Chống trùng lặp toàn bộ Batch
                             if (_processedMessages.TryAdd(messageId, 1))
                             {
-                                // BÁO CÁO: Tăng CurrentCache
                                 Trigger.AddDedupItem();
-
-                                // Thêm vào Time Wheel để 10 giây sau tự hủy
                                 long expireTimeMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + 10_000;
                                 _messageTtlWheel.AddOrUpdate(messageId, 1, expireTimeMs);
                             }
                             else
                             {
-                                // Đã có trong cache -> Skip
-                                continue;
+                                continue; // Bỏ qua trùng lặp
                             }
                         }
 
@@ -365,35 +364,40 @@ namespace Natify
             where TReq : IMessage
             where TRes : IMessage, new()
         {
-            if (_isDisposed) throw new ObjectDisposedException(nameof(NatifyServer));
+            Publish(topic, regionId, requestData, "REQ", out var reqId, string.Empty);
 
-            var subject = NatifyTopics.GetServerPublishSubject(_clientNameToConnect, _serverName, regionId, topic);
-            var (reqBuffer, reqLength) = NatifySerializer.Serialize(requestData);
-
-            var exactData = new byte[reqLength];
-            Array.Copy(reqBuffer, exactData, reqLength);
-            System.Buffers.ArrayPool<byte>.Shared.Return(reqBuffer);
-
-            try
+            if (!string.IsNullOrEmpty(reqId))
             {
-                var reply = await _connection.RequestAsync<byte[], byte[]>(
-                    subject, exactData,
-                    replyOpts: new NatsSubOpts { Timeout = timeout },
-                    cancellationToken: _cts.Token);
+                var cancellationTokenSource = new CancellationTokenSource();
+                var taskCompletionSource = new TaskCompletionSource<byte[]>();
 
-                var replyPayload = reply.Data ?? Array.Empty<byte>();
-                return NatifySerializer.Deserialize<TRes>(replyPayload, replyPayload.Length);
+                // --- BẮT ĐẦU ĐOẠN CODE CẦN THÊM ---
+                // Lắng nghe sự kiện token bị hủy (hết giờ)
+                cancellationTokenSource.Token.Register(() =>
+                {
+                    // Xóa task khỏi danh sách chờ để dọn dẹp RAM
+                    if (_replyTasks.TryRemove(reqId, out _))
+                    {
+                        // Ép Task phải ném ra lỗi TimeoutException ngay lập tức
+                        taskCompletionSource.TrySetException(
+                            new TimeoutException(
+                                $"[Natify] Request {reqId} timed out after {timeout.TotalMilliseconds}ms."));
+                    }
+                });
+                // --- KẾT THÚC ĐOẠN CODE CẦN THÊM ---
+
+                cancellationTokenSource.CancelAfter(timeout);
+                _replyTasks[reqId] = (taskCompletionSource, cancellationTokenSource);
+
+                // Lúc này, nếu quá 1 giây, TrySetException ở trên sẽ được kích hoạt
+                // Lệnh await dưới đây sẽ lập tức văng ra TimeoutException
+                var result = await taskCompletionSource.Task;
+
+                var t = NatifySerializer.Deserialize<TRes>(result, result.Length);
+                return t;
             }
-            catch (NatsNoReplyException)
-            {
-                throw new TimeoutException(
-                    $"Request trên topic '{topic}' đã bị Timeout sau {timeout.TotalMilliseconds}ms.");
-            }
-            catch (NatsNoRespondersException) // THÊM DÒNG NÀY VÀO ĐÂY
-            {
-                throw new TimeoutException(
-                    $"Nhanh: Không có Server nào đang lắng nghe topic '{topic}'. Request bị Timeout lập tức.");
-            }
+
+            throw new Exception($"[NatifyClient] Request Failed: {reqId}");
         }
 
         /// <summary>
@@ -403,55 +407,10 @@ namespace Natify
             where TReq : IMessage, new()
             where TRep : IMessage
         {
-            var subject = NatifyTopics.GetServerListenSubject(_serverName, _clientNameToConnect, topic);
-
-            _ = Task.Run(async () =>
+            OnMessage<TReq>(topic, tReq =>
             {
-                try
-                {
-                    await foreach (var msg in _connection.SubscribeAsync<byte[]>(subject, queueGroup: _groupName,
-                                       cancellationToken: _cts.Token))
-                    {
-                        // Nếu tin nhắn không có hộp thư trả lời (ReplyTo), bỏ qua vì đây không phải là Request
-                        if (string.IsNullOrEmpty(msg.ReplyTo)) continue;
-
-                        _ = Task.Run(async () =>
-                        {
-                            try
-                            {
-                                // 1. Trích xuất Region và Giải mã Request (An toàn với 0 byte Protobuf)
-                                var regionId = NatifyTopics.ExtractRegionIdFromServerSubject(msg.Subject);
-                                var payload = msg.Data ?? Array.Empty<byte>();
-                                var requestData = NatifySerializer.Deserialize<TReq>(payload, payload.Length);
-
-                                // 2. Chạy logic xử lý của Server (Đồng bộ)
-                                TRep replyData = handler((regionId, requestData));
-
-                                // 3. Mã hóa kết quả trả về
-                                var (replyBuffer, replyLength) = NatifySerializer.Serialize(replyData);
-                                var exactReplyData = new byte[replyLength];
-                                Array.Copy(replyBuffer, exactReplyData, replyLength);
-                                System.Buffers.ArrayPool<byte>.Shared.Return(replyBuffer);
-
-                                // 4. Bắn kết quả ngược lại đúng hòm thư INBOX của Client
-                                await _connection.PublishAsync(msg.ReplyTo, exactReplyData,
-                                    cancellationToken: _cts.Token);
-                            }
-                            catch (Exception ex)
-                            {
-                                Console.WriteLine($"[NatifyServer] OnRequest (Sync) Error on {topic}: {ex.Message}");
-                            }
-                        });
-                    }
-                }
-                catch (OperationCanceledException)
-                {
-                    /* Server đang tắt */
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"[NatifyServer] Subscribe Request Error on {topic}: {ex.Message}");
-                }
+                var result = handler((tReq.regionId, tReq.data.Value));
+                Publish($"Rep-{tReq.data.InstanceId}", tReq.regionId, result, "REP", out var reqId, tReq.data.ReqId);
             });
         }
 
@@ -462,53 +421,10 @@ namespace Natify
             where TReq : IMessage, new()
             where TRep : IMessage
         {
-            var subject = NatifyTopics.GetServerListenSubject(_serverName, _clientNameToConnect, topic);
-
-            _ = Task.Run(async () =>
+            OnMessage<TReq>(topic, async tReq =>
             {
-                try
-                {
-                    await foreach (var msg in _connection.SubscribeAsync<byte[]>(subject, queueGroup: _groupName,
-                                       cancellationToken: _cts.Token))
-                    {
-                        if (string.IsNullOrEmpty(msg.ReplyTo)) continue;
-
-                        _ = Task.Run(async () =>
-                        {
-                            try
-                            {
-                                // 1. Giải mã
-                                var regionId = NatifyTopics.ExtractRegionIdFromServerSubject(msg.Subject);
-                                var payload = msg.Data ?? Array.Empty<byte>();
-                                var requestData = NatifySerializer.Deserialize<TReq>(payload, payload.Length);
-
-                                // 2. Chạy logic xử lý của Server (Bất đồng bộ với await)
-                                TRep replyData = await handlerAsync((regionId, requestData));
-
-                                // 3. Mã hóa
-                                var (replyBuffer, replyLength) = NatifySerializer.Serialize(replyData);
-                                var exactReplyData = new byte[replyLength];
-                                Array.Copy(replyBuffer, exactReplyData, replyLength);
-                                System.Buffers.ArrayPool<byte>.Shared.Return(replyBuffer);
-
-                                // 4. Trả lời Client
-                                await _connection.PublishAsync(msg.ReplyTo, exactReplyData,
-                                    cancellationToken: _cts.Token);
-                            }
-                            catch (Exception ex)
-                            {
-                                Console.WriteLine($"[NatifyServer] OnRequest (Async) Error on {topic}: {ex.Message}");
-                            }
-                        });
-                    }
-                }
-                catch (OperationCanceledException)
-                {
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"[NatifyServer] Subscribe Request Error on {topic}: {ex.Message}");
-                }
+                var result = await handlerAsync((tReq.regionId, tReq.data.Value));
+                Publish($"Rep-{tReq.data.InstanceId}", tReq.regionId, result, "REP", out var reqId, tReq.data.ReqId);
             });
         }
 
