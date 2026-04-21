@@ -162,3 +162,6 @@ Khi gọi `client.Dispose()` hoặc `server.Dispose()`:
 4. An toàn đóng kết nối NATS.
 
 Bắt buộc phải gọi `.Dispose()` khi tắt ứng dụng hoặc khi đối tượng không còn được sử dụng để tránh Memory Leak.
+
+V 1.0.1 
+    - fix request bị miss tin nhắn nếu client gửi liên tục nhiều request cùng lúc
