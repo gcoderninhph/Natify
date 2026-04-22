@@ -72,6 +72,23 @@ client.OnRequest<IReqProto, IResProto>("topic", async request => {
 
 ---
 
+### Client `NatifyClientFast` (Dành cho Backend / Console App)
+
+Hoạt động với cơ chế y hệt như `NatifyClient` nhưng **không yêu cầu** vòng lặp `Tick()`. Phù hợp cho các ứng dụng .NET Core thông thường, hệ thống Microservices hoặc Worker Services cần đóng vai trò làm thiết bị trạm (Client) nhưng không chịu rào cản đồng bộ Main Thread giống môi trường Unity.
+
+Khởi tạo và sử dụng:
+```csharp
+var clientFast = new NatifyClientFast("nats://localhost:4222", "client_name", "group_name", "regionId", "server_name_to_connect");
+
+// Xử lý luồng ngầm (ThreadPool) đa luồng lập tức ngay khi có tin nhắn thay vì đợi Tick()
+clientFast.OnMessage<IMessageProto>("topic", data => 
+{
+    // ...
+});
+```
+
+---
+
 ### Server `NatifyServer` (Dành cho Game Server / Microservices)
 
 Khởi tạo Server:
@@ -163,5 +180,8 @@ Khi gọi `client.Dispose()` hoặc `server.Dispose()`:
 
 Bắt buộc phải gọi `.Dispose()` khi tắt ứng dụng hoặc khi đối tượng không còn được sử dụng để tránh Memory Leak.
 
+V 1.0.2
+    - Ra mắt `NatifyClientFast`: Phiên bản Client tối ưu tốc độ đa luồng dành riêng cho hệ thống Backend chạy ngầm (Tick-free).
+    - Cải thiện luồng Request xử lý tốt hơn ở mức cường độ lên tới hàng trăm ngàn tác vụ (200K RPS).
 V 1.0.1 
     - fix request bị miss tin nhắn nếu client gửi liên tục nhiều request cùng lúc

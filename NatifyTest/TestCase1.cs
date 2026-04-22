@@ -1,4 +1,6 @@
-﻿using NUnit.Framework;
+﻿using System.Collections.Concurrent;
+using Google.Protobuf.WellKnownTypes;
+using NUnit.Framework;
 using Natify;
 
 namespace Natify.Tests

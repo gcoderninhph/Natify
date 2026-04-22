@@ -1,0 +1,36 @@
+syntax = "proto3";
+package Natify.Test.GRPC;
+
+
+message TestRequest {
+  string name = 1;
+  string name2 = 2;
+  string name3 = 3;
+  string name4 = 4;
+  string name5 = 5;
+  string name6 = 6;
+  string name7 = 7;
+  string name8 = 8;
+  string name9 = 9;
+  string name10 = 10; 
+  repeated string nameList = 11;
+  repeated string nameList2 = 12;
+  repeated string nameList3 = 13;
+  repeated string nameList4 = 14;
+  repeated string nameList5 = 15;
+  repeated int32 intList = 16;
+  repeated int32 intList2 = 17;
+  repeated int32 intList3 = 18;
+  repeated int32 intList4 = 19;
+  repeated int32 intList5 = 20;
+  repeated float floatList = 21;
+  repeated float floatList2 = 22;
+  repeated float floatList3 = 23;
+  repeated float floatList4 = 24;
+  repeated float floatList5 = 25;
+  repeated int64 int64List = 26;
+  repeated int64 int64List2 = 27;
+  repeated int64 int64List3 = 28;
+  repeated int64 int64List4 = 29;
+  repeated int64 int64List5 = 30;
+}

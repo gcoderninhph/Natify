@@ -9,5 +9,6 @@
   &lt;Or&gt;&#xD;
     &lt;ProjectFile&gt;6B7BA39C-31EC-49C2-B57D-D8BC7CBCAFCD/f:TestCase1.cs&lt;/ProjectFile&gt;&#xD;
     &lt;ProjectFile&gt;6B7BA39C-31EC-49C2-B57D-D8BC7CBCAFCD/f:TestCase2.cs&lt;/ProjectFile&gt;&#xD;
+    &lt;ProjectFile&gt;6B7BA39C-31EC-49C2-B57D-D8BC7CBCAFCD/f:NatifyClientFastTests.cs&lt;/ProjectFile&gt;&#xD;
   &lt;/Or&gt;&#xD;
 &lt;/SessionState&gt;</s:String></wpf:ResourceDictionary>

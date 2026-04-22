@@ -1,5 +1,6 @@
 ﻿using System.Collections.Concurrent;
-using Google.Protobuf.WellKnownTypes; // Dùng các Protobuf có sẵn của Google
+using Google.Protobuf.WellKnownTypes;
+using Natify.Test.GRPC; // Dùng các Protobuf có sẵn của Google
 
 namespace Natify.Tests
 {
@@ -1841,6 +1842,198 @@ namespace Natify.Tests
                 $"[Test 40] Hoàn thành {totalRequests:N0} RPC S2C trong {stopwatch.ElapsedMilliseconds}ms. Thành công: {successCount}");
             Assert.That(successCount, Is.EqualTo(totalRequests),
                 "Bị rớt gói hoặc sai lệch dữ liệu RPC từ Server xuống Client!");
+        }
+
+
+        [Test]
+        [Category("Performance")]
+        public async Task Test41_LagBody()
+        {
+            int totalMessages = 1_000_000;
+            int receivedCount = 0;
+            var waitHandle = new ManualResetEventSlim(false);
+
+
+            _server.OnMessage<TestRequest>("ThroughputTest", data =>
+            {
+                if (Interlocked.Increment(ref receivedCount) == totalMessages)
+                {
+                    waitHandle.Set();
+                }
+            });
+
+            await Task.Delay(500); // Làm nóng kết nối
+
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+            // Act: Xả 100.000 tin nhắn nhanh nhất có thể (Sử dụng Task.Run để không block luồng test)
+            _ = Task.Run(() =>
+            {
+                for (int i = 0; i < totalMessages; i++)
+                {
+                    _clientA.Publish("ThroughputTest", new TestRequest
+                    {
+                        Name = $"Player_{i}",
+                        Name2 = $"Player2_{i}",
+                        Name3 = $"Player3_{i}",
+                        Name4 = $"Player4_{i}",
+                        Name5 = $"Player5_{i}",
+                        Name6 = $"Player6_{i}",
+                        Name7 = $"Player7_{i}",
+                        Name8 = $"Player8_{i}",
+                        Name9 = $"Player9_{i}",
+                        Name10 = $"Player10_{i}",
+                        NameList = { $"List_{i}_1", $"List_{i}_2", $"List_{i}_3", $"List_{i}_4", $"List_{i}_5" },
+                        NameList2 = { $"List2_{i}_1", $"List2_{i}_2", $"List2_{i}_3", $"List2_{i}_4", $"List2_{i}_5" },
+                        NameList3 = { $"List3_{i}_1", $"List3_{i}_2", $"List3_{i}_3", $"List3_{i}_4", $"List3_{i}_5" },
+                        NameList4 = { $"List4_{i}_1", $"List4_{i}_2", $"List4_{i}_3", $"List4_{i}_4", $"List4_{i}_5" },
+                        NameList5 = { $"List5_{i}_1", $"List5_{i}_2", $"List5_{i}_3", $"List5_{i}_4", $"List5_{i}_5" },
+                        Int64List = { i, i + 1, i + 2, i + 3, i + 4 },
+                        Int64List2 = { i, i + 1, i + 2, i + 3, i + 4 },
+                        Int64List3 = { i, i + 1, i + 2, i + 3, i + 4 },
+                        Int64List4 = { i, i + 1, i + 2, i + 3, i + 4 },
+                        Int64List5 = { i, i + 1, i + 2, i + 3, i + 4 },
+                        IntList = { i, i + 1, i + 2, i + 3, i + 4 },
+                        IntList2 = { i, i + 1, i + 2, i + 3, i + 4 },
+                        IntList3 = { i, i + 1, i + 2, i + 3, i + 4 },
+                        IntList4 = { i, i + 1, i + 2, i + 3, i + 4 },
+                        IntList5 = { i, i + 1, i + 2, i + 3, i + 4 },
+                        FloatList = { i * 1.0f, i * 1.1f, i * 1.2f, i * 1.3f, i * 1.4f },
+                        FloatList2 = { i * 1.0f, i * 1.1f, i * 1.2f, i * 1.3f, i * 1.4f },
+                        FloatList3 = { i * 1.0f, i * 1.1f, i * 1.2f, i * 1.3f, i * 1.4f },
+                        FloatList4 = { i * 1.0f, i * 1.1f, i * 1.2f, i * 1.3f, i * 1.4f },
+                        FloatList5 = { i * 1.0f, i * 1.1f, i * 1.2f, i * 1.3f, i * 1.4f }
+                    });
+                }
+            });
+
+            // Chờ tối đa 10 giây
+            bool success = waitHandle.Wait(TimeSpan.FromSeconds(10));
+            stopwatch.Stop();
+
+
+            Assert.That(success, Is.True,
+                $"Timeout! Chỉ nhận được {receivedCount}/{totalMessages}");
+
+            // Tính toán MPS
+            double seconds = stopwatch.Elapsed.TotalSeconds;
+            double mps = totalMessages / seconds;
+
+            Console.WriteLine(
+                $"[Test 41] Đã nhận {totalMessages:N0} tin nhắn trong {seconds:F3}s. Tốc độ: {mps:N0} MPS.");
+
+            // Assert hiệu suất tối thiểu (Ví dụ: phải lớn hơn 10.000 tin nhắn / giây)
+            Assert.That(mps, Is.GreaterThan(1000),
+                "Hiệu suất quá thấp, có thể đang bị nghẽn cổ chai ở Serialize hoặc Channel!");
+        }
+
+        [Test] // Thiếu parts
+        [Category("Performance")]
+        public async Task Test42_Request_LagBody()
+        {
+            int totalMessages = 200_000;
+            int receivedCount = 0;
+            var waitHandle = new ManualResetEventSlim(false);
+            var cts = new CancellationTokenSource();
+            _ = Task.Run(() =>
+            {
+                while (!cts.IsCancellationRequested)
+                {
+                    _clientA.Tick(); // Lấy 100 action/lần
+                }
+            });
+
+            _clientA.OnRequest<Int32Value, TestRequest>("ThroughputTest", data =>
+            {
+                var i = data.Value;
+                return new TestRequest
+                {
+                    Name = $"Player_{i}",
+                    Name2 = $"Player2_{i}",
+                    Name3 = $"Player3_{i}",
+                    Name4 = $"Player4_{i}",
+                    Name5 = $"Player5_{i}",
+                    Name6 = $"Player6_{i}",
+                    Name7 = $"Player7_{i}",
+                    Name8 = $"Player8_{i}",
+                    Name9 = $"Player9_{i}",
+                    Name10 = $"Player10_{i}",
+                    NameList = { $"List_{i}_1", $"List_{i}_2", $"List_{i}_3", $"List_{i}_4", $"List_{i}_5" },
+                    NameList2 = { $"List2_{i}_1", $"List2_{i}_2", $"List2_{i}_3", $"List2_{i}_4", $"List2_{i}_5" },
+                    NameList3 = { $"List3_{i}_1", $"List3_{i}_2", $"List3_{i}_3", $"List3_{i}_4", $"List3_{i}_5" },
+                    NameList4 = { $"List4_{i}_1", $"List4_{i}_2", $"List4_{i}_3", $"List4_{i}_4", $"List4_{i}_5" },
+                    NameList5 = { $"List5_{i}_1", $"List5_{i}_2", $"List5_{i}_3", $"List5_{i}_4", $"List5_{i}_5" },
+                    Int64List = { i, i + 1, i + 2, i + 3, i + 4 },
+                    Int64List2 = { i, i + 1, i + 2, i + 3, i + 4 },
+                    Int64List3 = { i, i + 1, i + 2, i + 3, i + 4 },
+                    Int64List4 = { i, i + 1, i + 2, i + 3, i + 4 },
+                    Int64List5 = { i, i + 1, i + 2, i + 3, i + 4 },
+                    IntList = { i, i + 1, i + 2, i + 3, i + 4 },
+                    IntList2 = { i, i + 1, i + 2, i + 3, i + 4 },
+                    IntList3 = { i, i + 1, i + 2, i + 3, i + 4 },
+                    IntList4 = { i, i + 1, i + 2, i + 3, i + 4 },
+                    IntList5 = { i, i + 1, i + 2, i + 3, i + 4 },
+                    FloatList = { i * 1.0f, i * 1.1f, i * 1.2f, i * 1.3f, i * 1.4f },
+                    FloatList2 = { i * 1.0f, i * 1.1f, i * 1.2f, i * 1.3f, i * 1.4f },
+                    FloatList3 = { i * 1.0f, i * 1.1f, i * 1.2f, i * 1.3f, i * 1.4f },
+                    FloatList4 = { i * 1.0f, i * 1.1f, i * 1.2f, i * 1.3f, i * 1.4f },
+                    FloatList5 = { i * 1.0f, i * 1.1f, i * 1.2f, i * 1.3f, i * 1.4f }
+                };
+            });
+
+            await Task.Delay(500); // Làm nóng kết nối
+
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+            var timeOut = TimeSpan.FromSeconds(5);
+
+            // Act: Xả 100.000 tin nhắn nhanh nhất có thể (Sử dụng Task.Run để không block luồng test)
+            _ = Task.Run(() =>
+            {
+                for (int i = 0; i < totalMessages; i++)
+                {
+                    var index = i;
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            var response = await
+                                _server.RequestAsync<Int32Value, TestRequest>("ThroughputTest", "VN-01",
+                                    new Int32Value { Value = index }, timeOut);
+
+                            if (Interlocked.Increment(ref receivedCount) == totalMessages)
+                            {
+                                waitHandle.Set();
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"[Test 42] Request {index} failed: {ex.Message}");
+                        }
+                    });
+                }
+            });
+
+            // Chờ tối đa 10 giây
+            bool success = waitHandle.Wait(TimeSpan.FromSeconds(50));
+            stopwatch.Stop();
+            
+            await cts.CancelAsync(); // Dừng vòng lặp Tick
+
+
+            Assert.That(success, Is.True,
+                $"Timeout! Chỉ nhận được {receivedCount}/{totalMessages}");
+
+            // Tính toán MPS
+            double seconds = stopwatch.Elapsed.TotalSeconds;
+            double mps = totalMessages / seconds;
+
+            Console.WriteLine(
+                $"[Test 41] Đã nhận {totalMessages:N0} tin nhắn trong {seconds:F3}s. Tốc độ: {mps:N0} MPS.");
+
+            // Assert hiệu suất tối thiểu (Ví dụ: phải lớn hơn 10.000 tin nhắn / giây)
+            Assert.That(mps, Is.GreaterThan(1000),
+                "Hiệu suất quá thấp, có thể đang bị nghẽn cổ chai ở Serialize hoặc Channel!");
         }
     }
 }

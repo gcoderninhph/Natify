@@ -10,6 +10,11 @@
     </PropertyGroup>
 
     <ItemGroup>
+        <PackageReference Include="Google.Protobuf" Version="3.34.1"/>
+        <PackageReference Include="Grpc.Tools" Version="2.80.0">
+            <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+            <PrivateAssets>all</PrivateAssets>
+        </PackageReference>
         <PackageReference Include="coverlet.collector" Version="6.0.2"/>
         <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0"/>
         <PackageReference Include="NUnit" Version="4.2.2"/>
@@ -22,7 +27,12 @@
     </ItemGroup>
 
     <ItemGroup>
-      <ProjectReference Include="..\Natify\Natify.csproj" />
+        <ProjectReference Include="..\Natify\Natify.csproj"/>
     </ItemGroup>
+
+    <ItemGroup>
+        <Protobuf Include="Protos\*.proto" GrpcServices="None"/>
+    </ItemGroup>
+
 
 </Project>
