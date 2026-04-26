@@ -154,37 +154,48 @@ public class TimedSortedSet<TKey, TValue> : IDisposable
     /// <param name="expireTime">Unix milliseconds — DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + offset</param>
     public void AddOrUpdate(TKey key, TValue value, long expireTime)
     {
-        _rwLock.EnterWriteLock();
         try
         {
-            if (_lookup.TryGetValue(key, out var existing))
-                existing.List!.Remove(existing);
+            _rwLock.EnterWriteLock();
+            try
+            {
+                if (_lookup.TryGetValue(key, out var existing))
+                    existing.List?.Remove(existing);
 
-            var entry = new TimedEntry(key, value, expireTime);
-            _lookup[key] = InsertToWheel(entry);
+                var entry = new TimedEntry(key, value, expireTime);
+                _lookup[key] = InsertToWheel(entry);
+            }
+            finally
+            {
+                _rwLock.ExitWriteLock();
+            }
         }
-        finally
-        {
-            _rwLock.ExitWriteLock();
-        }
+        catch (ObjectDisposedException) { }
     }
 
     public bool Remove(TKey key)
     {
         TValue removedValue;
 
-        _rwLock.EnterWriteLock();
         try
         {
-            if (!_lookup.TryGetValue(key, out var node)) return false;
+            _rwLock.EnterWriteLock();
+            try
+            {
+                if (!_lookup.TryGetValue(key, out var node)) return false;
 
-            removedValue = node.Value.Value;
-            node.List!.Remove(node);
-            _lookup.Remove(key);
+                removedValue = node.Value.Value;
+                node.List?.Remove(node);
+                _lookup.Remove(key);
+            }
+            finally
+            {
+                _rwLock.ExitWriteLock();
+            }
         }
-        finally
+        catch (ObjectDisposedException)
         {
-            _rwLock.ExitWriteLock();
+            return false;
         }
 
         // Kích hoạt event SAU khi release lock
@@ -245,40 +256,46 @@ public class TimedSortedSet<TKey, TValue> : IDisposable
         long targetTick = ToRelativeTick(nowTicks);
         List<(TKey, TValue)>? expired = null;
 
-        _rwLock.EnterWriteLock();
         try
         {
-            while (_currentTick <= targetTick)
+            _rwLock.EnterWriteLock();
+            try
             {
-                int slot0 = (int)(_currentTick & W0_MASK);
+                if (_disposed) return;
 
-                if (slot0 == 0)
+                while (_currentTick <= targetTick)
                 {
-                    int slot1 = (int)((_currentTick / W0_RANGE) & W1_MASK);
-                    if (slot1 == 0)
-                        Cascade(_wheel2[(int)((_currentTick / W1_RANGE) & W2_MASK)]);
-                    Cascade(_wheel1[slot1]);
-                }
+                    int slot0 = (int)(_currentTick & W0_MASK);
 
-                var bucket = _wheel0[slot0];
-                var node = bucket.First;
-                while (node != null)
-                {
-                    var next = node.Next;
-                    _lookup.Remove(node.Value.Key);
-                    expired ??= new();
-                    expired.Add((node.Value.Key, node.Value.Value));
-                    bucket.Remove(node);
-                    node = next;
-                }
+                    if (slot0 == 0)
+                    {
+                        int slot1 = (int)((_currentTick / W0_RANGE) & W1_MASK);
+                        if (slot1 == 0)
+                            Cascade(_wheel2[(int)((_currentTick / W1_RANGE) & W2_MASK)]);
+                        Cascade(_wheel1[slot1]);
+                    }
 
-                _currentTick++;
+                    var bucket = _wheel0[slot0];
+                    var node = bucket.First;
+                    while (node != null)
+                    {
+                        var next = node.Next;
+                        _lookup.Remove(node.Value.Key);
+                        expired ??= new();
+                        expired.Add((node.Value.Key, node.Value.Value));
+                        bucket.Remove(node);
+                        node = next;
+                    }
+
+                    _currentTick++;
+                }
+            }
+            finally
+            {
+                _rwLock.ExitWriteLock();
             }
         }
-        finally
-        {
-            _rwLock.ExitWriteLock();
-        }
+        catch (ObjectDisposedException) { }
 
         try
         {
@@ -298,7 +315,7 @@ public class TimedSortedSet<TKey, TValue> : IDisposable
         {
             var next = node.Next;
             bucket.Remove(node);
-            InsertToWheel(node.Value);
+            _lookup[node.Value.Key] = InsertToWheel(node.Value);
             node = next;
         }
     }

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -89,10 +89,12 @@ namespace Natify
                                        cancellationToken: _cts.Token))
                     {
                         var parts = msg.Subject.Split('.');
-                        string messageId = parts[^1];
-
-                        // Nhận được ACK -> Xóa khỏi hàng đợi
-                        _unackedMessages.TryRemove(messageId, out _);
+                        if (parts.Length >= 6)
+                        {
+                            string messageId = parts[5];
+                            // Nhận được ACK -> Xóa khỏi hàng đợi
+                            _unackedMessages.TryRemove(messageId, out _);
+                        }
                     }
                 }
                 catch (OperationCanceledException)
