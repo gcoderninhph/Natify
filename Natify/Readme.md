@@ -1,187 +1,315 @@
-### Natify
+# Natify — High-Performance Communication Framework
 
-Đây là một framework giao tiếp High-Performance dành cho kiến trúc Microservice và Game Server (đặc biệt tối ưu cho Unity), được xây dựng trên nền tảng NATS Core.
+> Built on NATS Core | Version 1.0.2 | netstandard2.0
 
-#### Phụ thuộc (Dependencies)
-- **Google.Protobuf** (v3.34.1): Mã hóa dữ liệu siêu tốc.
-- **NATS.Client.Core** (v2.7.3): Giao tiếp mạng (Không cần cấu hình JetStream phức tạp).
-- **System.Threading.Channels**: Xử lý hàng đợi đa luồng Lock-free.
+Framework giao tiếp hiệu năng cao cho Microservice và Game Server (tối ưu Unity), xây trên nền NATS Core.
 
----
+## Dependencies
 
-### Tính năng Nổi bật (Core Features)
-1. **Micro-Batching 2 Chiều:** Tự động gom lô tin nhắn để tối ưu băng thông. Kích hoạt xả lô khi đạt 1.000 tin nhắn, hoặc 50KB, hoặc sau 50ms.
-2. **Tin cậy cấp Ứng dụng (Reliability):** Tự động gửi ACK và Retry (thử lại) nếu gói tin bị rớt do lỗi mạng, đảm bảo không bao giờ mất tin nhắn (At-Least-Once Delivery).
-3. **Chống trùng lặp siêu tốc (O(1) Deduplication):** Tích hợp `TimedSortedSet` (Time Wheel) dọn rác tự động sau 10 giây, chặn đứng lỗi nhân đôi dữ liệu (Dupe Bug) khi mạng chập chờn.
-4. **Graceful Shutdown (Tắt mềm):** Cơ chế `Dispose()` an toàn, chờ vắt kiệt hàng đợi và xác nhận ACK trước khi ngắt mạng, chống treo Game/App.
-5. **Telemetry & Triggers:** Tích hợp bộ đếm nguyên tử (Atomic Counters) để giám sát RAM, lưu lượng mạng và số lượng gói tin theo thời gian thực mà không làm nghẽn luồng chính.
+| Package | Version | Purpose |
+|---------|---------|---------|
+| Google.Protobuf | 3.34.1 | Serialization |
+| NATS.Net (NATS.Client.Core) | 2.7.3 | Network transport |
+| System.Threading.Channels | built-in | Lock-free queue |
+
+**Không cần** NATS JetStream.
 
 ---
 
-### Client `NatifyClient` (Dành cho Unity / App)
+## Architecture Deep Dive
 
-Khởi tạo Client:
-```csharp
-var client = new NatifyClient("nats://localhost:4222", "client_name", "group_name", "regionId", "server_name_to_connect");
-```
-- `client_name`: Tên định danh của client.
-- `group_name`: Consumer Group của NATS (chia sẻ tải).
-- `regionId`: ID phân vùng của Client (VD: "VN-01").
-- `server_name_to_connect`: Tên Server đích muốn kết nối tới.
+### 1. Queue Group & Horizontal Scaling
 
-#### 1. Nhận tin nhắn (Subscribe)
+**Đây là điểm quan trọng nhất — dễ bị hiểu nhầm.**
+
+Tham số `groupName` trong constructor **chính là NATS queue group**. Khi N instance cùng `groupName` subscribe cùng subject, NATS Core tự động giao mỗi message cho **đúng 1 instance** duy nhất:
+
 ```csharp
-client.OnMessage<IMessageProto>("topic", data => 
-{
-    // Xử lý dữ liệu
-});
+// Trong OnMessage — NatifyClient.cs:290 và NatifyServer.cs:293
+_connection.SubscribeAsync<byte[]>(subject, queueGroup: _groupName, ...)
 ```
-- **Lưu ý quan trọng cho Unity:** Callback truyền vào `OnMessage` sẽ **KHÔNG** chạy ngay lập tức. Nó được đẩy vào một hàng đợi an toàn. Bạn bắt buộc phải gọi hàm `client.Tick()` trong vòng lặp `Update()` của Unity để thực thi callback trên Main Thread.
+
+→ **Có thể scale N instance an toàn**, không lo duplicate processing.
+
+**Ví dụ Router scale ngang:**
 ```csharp
-void Update()
+// Router instance 1
+new NatifyServer("nats://localhost:4222", "Router", "RouterGroup", "*");
+
+// Router instance 2 — cùng serverName + groupName
+new NatifyServer("nats://localhost:4222", "Router", "RouterGroup", "*");
+
+// NATS chỉ gửi mỗi message từ Unity đến 1 trong 2 instance
+```
+
+### 2. Dedup Scope (Chống trùng lặp)
+
+Dedup trong Natify (`_processedMessages` + `TimedSortedSet`, TTL 10s) dùng để chặn **cùng 1 instance** xử lý cùng 1 batch 2 lần do retransmission (at-least-once retry).
+
+**Đây KHÔNG phải cross-instance dedup.** Cross-instance được NATS queue group xử lý.
+
+```
+Cùng 1 instance:         sender → NATS → receiver → ACK lost → retry → receiver
+                                                                    ↓
+                         dedup ngăn không xử lý batch lần 2       ✓
+
+Nhiều instance:          sender → NATS → instance-1 (nhận) + instance-2 (không nhận)
+                         queue group đảm bảo chỉ 1 instance nhận  ✓
+```
+
+### 3. Thread Model
+
+| Class | Callback thread | Cần Tick()? |
+|-------|----------------|-------------|
+| `NatifyClient` (Unity) | Main Thread (qua `Tick()`) | **CÓ** |
+| `NatifyClientFast` (Backend) | ThreadPool (ngay lập tức) | KHÔNG |
+| `NatifyServer` | ThreadPool (ngay lập tức) | KHÔNG |
+| `Trigger` evaluation | ThreadPool (mỗi 500ms) | KHÔNG |
+
+**Quan trọng:** Trong Unity, `NatifyClient` đẩy callback vào `ConcurrentQueue<Action>`, `Tick()` lấy tối đa 100 action/frame xử lý trên Main Thread. Không gọi `Tick()` = callback không bao giờ chạy.
+
+### 4. Topic Convention (NatifyTopics)
+
+Tất cả subject được auto-generate — **code chỉ cần dùng topic "clean"**, không prefix:
+
+| Direction | Method | Generated Subject |
+|-----------|--------|-------------------|
+| Client → Server (publish) | `GetClientPublishSubject` | `NatifyServer.{server}.{client}.{region}.{topic}` |
+| Server → Client (publish) | `GetServerPublishSubject` | `NatifyClient.{client}.{server}.{region}.{topic}` |
+| Server listen (wildcard region) | `GetServerListenSubject` | `NatifyServer.{server}.{client}.*.{topic}` |
+| Client listen | `GetClientListenSubject` | `NatifyClient.{client}.{server}.{region}.{topic}` |
+
+- `*` trong server listen subject là **wildcard cho REGION**, không phải clientName.
+- Server luôn nhận được `regionId` trong callback để biết message từ region nào.
+
+### 5. Request-Reply Mechanism
+
+```
+Client gọi RequestAsync("Login", req, timeout)
+    │
+    ├── Publish("Login", req, "REQ", out reqId)
+    │       → NATS: NatifyServer.Srv.Client.VN.Login
+    │
+    ├──_replyTasks[reqId] = (TCS, CTS)     // chờ reply
+    │
+    │   Server xử lý OnRequest:
+    │       → return reply
+    │       → Publish("Rep-{instanceId}", reply, "REP", repId=reqId)
+    │           → NATS: NatifyClient.Client.Srv.VN.Rep-{instanceId}
+    │
+    └── Nhận reply → _replyTasks[reqId].SetResult(bytes)
+            → Deserialize<TRes> → return
+```
+
+Server trả lời qua topic `Rep-{instanceId}` — instanceId là `Guid.NewGuid()` của client, đảm bảo reply về đúng client gửi request.
+
+### 6. Micro-Batching
+
+Message được gom vào `Channel<(subject, payload, type, reqId, repId)>`, background worker flush batch khi đạt:
+- **1000 messages** hoặc
+- **50KB** payload hoặc
+- **50ms** kể từ message đầu tiên
+
+Batch được serialize thành `NatifyBatch` protobuf, publish kèm `Natify-BatchId` header.
+
+### 7. Reliability (ACK + Retry)
+
+Mỗi batch gửi đi được lưu vào `_unackedMessages`. Retry loop quét mỗi 100ms:
+- Nếu `now - LastSent > 100ms` → retry (tối đa 10 lần)
+- Receiver gửi ACK về `NatifyServer.{srv}.{client}.{region}.ACK.{batchId}`
+- Khi nhận ACK → xóa khỏi `_unackedMessages`
+- Receiver dùng dedup để bỏ qua batch đã xử lý nếu retry đến
+
+### 8. Graceful Shutdown (Dispose)
+
+```
+1. batchChannel.Writer.Complete()           // Khóa van đầu vào
+2. Task.WaitAll(batchWorker, 2s)            // Chờ xả nốt batch cuối
+3. Chờ ACK drain (2s)                       // Đợi đối tác xác nhận
+4. _cts.Cancel()                            // Ngắt vòng lặp ngầm
+5. Task.WaitAll(retryWorker, ackListener, 1s) // Chờ luồng tắt
+6. _connection.DisposeAsync()               // Đóng kết nối
+7. _messageTtlWheel.Dispose()               // Giải phóng time wheel
+```
+
+---
+
+## Complete API Reference
+
+### NatifyServer
+
+```csharp
+public class NatifyServer : IDisposable
+```
+
+| Member | Signature |
+|--------|-----------|
+| **ctor** | `NatifyServer(string url, string serverName, string groupName, string clientNameToConnect)` |
+| `Publish` | `void Publish<T>(string topic, string regionId, T msg) where T : IMessage` |
+| `OnMessage` | `void OnMessage<T>(string topic, Action<(string regionId, Data<T> data)> cb) where T : IMessage, new()` |
+| `OnMessage` | `void OnMessage<T>(string topic, Func<(string regionId, Data<T> data), Task> cb)` |
+| `RequestAsync` | `Task<TRes> RequestAsync<TReq, TRes>(string topic, string regionId, TReq data, TimeSpan timeout)` |
+| `OnRequest` | `void OnRequest<TReq, TRep>(string topic, Func<(string regionId, TReq req), TRep> handler)` |
+| `OnRequest` | `void OnRequest<TReq, TRep>(string topic, Func<(string regionId, TReq req), Task<TRep>> handlerAsync)` |
+| `Trigger` | `NatifyServerTriggers Trigger { get; }` |
+| `Dispose` | `void Dispose()` |
+
+**Tham số constructor:**
+- `url` — NATS URL (vd: `"nats://localhost:4222"`)
+- `serverName` — Định danh server này (xuất hiện trong NATS subject)
+- `groupName` — **NATS queue group** → dùng chung cho tất cả instance cùng loại để scale ngang
+- `clientNameToConnect` — Tên client pattern để listen. Dùng `"*"` để match mọi client.
+
+### NatifyClient (Unity)
+
+```csharp
+public class NatifyClient : IDisposable
+```
+
+| Member | Signature |
+|--------|-----------|
+| **ctor** | `NatifyClient(string url, string clientName, string groupName, string regionId, string serverNameToConnect)` |
+| `Publish` | `void Publish<T>(string topic, T msg) where T : IMessage` |
+| `OnMessage` | `void OnMessage<T>(string topic, Action<Data<T>> cb) where T : IMessage, new()` |
+| `OnMessage` | `void OnMessage<T>(string topic, Func<Data<T>, Task> cb)` |
+| `RequestAsync` | `Task<TRes> RequestAsync<TReq, TRes>(string topic, TReq data, TimeSpan timeout)` |
+| `OnRequest` | `void OnRequest<TReq, TRep>(string topic, Func<TReq, TRep> handler)` |
+| `OnRequest` | `void OnRequest<TReq, TRep>(string topic, Func<TReq, Task<TRep>> handlerAsync)` |
+| `Tick` | `void Tick()` — **Bắt buộc gọi trong Update()**, xử lý tối đa 100 callback/frame |
+| `Trigger` | `NatifyClientTriggers Trigger { get; }` |
+| `Dispose` | `void Dispose()` |
+
+### NatifyClientFast (Backend / Console)
+
+```csharp
+public class NatifyClientFast : IDisposable
+```
+
+API giống hệt `NatifyClient` nhưng:
+- **Không có `Tick()`** — callback chạy ngay trên ThreadPool
+- Callback truyền vào `OnMessage` nhận `Data<T>` (không qua hàng đợi main thread)
+
+### Data\<T\> — Message Envelope
+
+```csharp
+public readonly struct Data<T>
 {
-    client.Tick(); // Lấy tối đa 100 action ra xử lý mỗi frame
+    public T Value;           // Đã deserialize
+    public string InstanceId; // Instance gửi
+    public string ReqId;      // Request correlation ID
+    public string RepId;      // Reply correlation ID
 }
 ```
 
-#### 2. Gửi tin nhắn (Publish)
-```csharp
-client.Publish("topic", new IMessageProto { ... });
-```
-- Cơ chế gửi là **Fire-and-Forget ở luồng gọi**, nhưng bên dưới dữ liệu được đẩy vào `Channel`, gom thành Batch và gửi đi an toàn ở một luồng ngầm (`BatchWorker`), không làm giật lag FPS.
+### NatifyServer callbacks — Tuple pattern
 
-#### 3. Request - Reply (RPC)
-Gửi yêu cầu và đợi kết quả (Bất đồng bộ):
 ```csharp
-var response = await client.RequestAsync<IReqProto, IResProto>("topic", requestData, TimeSpan.FromSeconds(2));
-```
-
-Lắng nghe và trả lời Request từ Server (Chạy trên Unity Main Thread):
-```csharp
-// Dạng Đồng bộ (Xử lý logic nhanh)
-client.OnRequest<IReqProto, IResProto>("topic", request => {
-    return new IResProto { ... };
-});
-
-// Dạng Bất đồng bộ (Load Asset, đọc File)
-client.OnRequest<IReqProto, IResProto>("topic", async request => {
-    await Task.Delay(500); // Tác vụ nặng
-    return new IResProto { ... };
+server.OnMessage<MyMsg>("topic", tuple => {
+    var regionId    = tuple.regionId;  // region của client gửi
+    var data        = tuple.data;      // Data<MyMsg> envelope
+    var msg         = data.Value;      // MyMsg đã deserialize
 });
 ```
+
+### Trigger Telemetry
+
+`NatifyClientTriggers` / `NatifyServerTriggers` — cả hai giống nhau:
+
+| Property | Type | Mô tả |
+|----------|------|-------|
+| `BytesSent` | long | Tổng bytes đã gửi |
+| `BytesReceived` | long | Tổng bytes đã nhận |
+| `MessagesSent` | long | Tổng messages riêng lẻ đã gửi |
+| `MessagesReceived` | long | Tổng messages riêng lẻ đã nhận |
+| `BatchesSent` / `BatchesReceived` | long | Tổng batch |
+| `ErrorsCount` | long | Tổng lỗi |
+| `CurrentDedupCacheSize` | long | Items trong dedup cache |
+| `TotalDedupExpired` | long | Items đã hết hạn khỏi dedup |
+| `ProcessMemoryMB` | double | RAM process (MB) |
+
+| Method | Signature |
+|--------|-----------|
+| `RegisterTrigger` | `Guid RegisterTrigger(Func<T, bool> condition, Action<T> action, bool oneTime = false)` |
+| `RemoveTrigger` | `void RemoveTrigger(Guid ruleId)` |
+
+Triggers được đánh giá mỗi 500ms trên ThreadPool.
 
 ---
 
-### Client `NatifyClientFast` (Dành cho Backend / Console App)
+## Code Examples
 
-Hoạt động với cơ chế y hệt như `NatifyClient` nhưng **không yêu cầu** vòng lặp `Tick()`. Phù hợp cho các ứng dụng .NET Core thông thường, hệ thống Microservices hoặc Worker Services cần đóng vai trò làm thiết bị trạm (Client) nhưng không chịu rào cản đồng bộ Main Thread giống môi trường Unity.
+### Pub/Sub cơ bản
 
-Khởi tạo và sử dụng:
 ```csharp
-var clientFast = new NatifyClientFast("nats://localhost:4222", "client_name", "group_name", "regionId", "server_name_to_connect");
-
-// Xử lý luồng ngầm (ThreadPool) đa luồng lập tức ngay khi có tin nhắn thay vì đợi Tick()
-clientFast.OnMessage<IMessageProto>("topic", data => 
-{
-    // ...
+// Server
+var server = new NatifyServer("nats://localhost:4222", "GameServer", "SrvGroup", "*");
+server.OnMessage<StringValue>("Chat", tuple => {
+    Console.WriteLine($"[{tuple.regionId}] {tuple.data.Value.Value}");
 });
+
+// Client (Backend)
+var client = new NatifyClientFast("nats://localhost:4222", "Client1", "Grp1", "VN", "GameServer");
+client.Publish("Chat", new StringValue { Value = "Hello" });
 ```
 
----
+### Request/Reply
 
-### Server `NatifyServer` (Dành cho Game Server / Microservices)
-
-Khởi tạo Server:
 ```csharp
-var server = new NatifyServer("nats://localhost:4222", "server_name", "group_name", "client_name_to_connect");
-```
-
-#### 1. Nhận tin nhắn
-```csharp
-server.OnMessage<IMessageProto>("topic", callbackData => 
-{
-    string regionId = callbackData.regionId;
-    IMessageProto data = callbackData.data;
+// Server xử lý request
+server.OnRequest<StringValue, StringValue>("Login", tuple => {
+    return new StringValue { Value = tuple.request.Value + "_OK" };
 });
-```
-- Khác với Client, Server xử lý dữ liệu đa luồng lập tức ngay khi nhận được, tối đa hóa sức mạnh CPU. Không cần gọi `Tick()`.
 
-#### 2. Gửi tin nhắn xuống Client
-```csharp
-// Cần chỉ định đích danh RegionId của Client
-server.Publish("topic", "VN-01", new IMessageProto { ... });
+// Client gọi request
+var reply = await client.RequestAsync<StringValue, StringValue>(
+    "Login", new StringValue { Value = "user123" }, TimeSpan.FromSeconds(5));
+Console.WriteLine(reply.Value); // "user123_OK"
 ```
 
-#### 3. Request - Reply (RPC)
-Gửi yêu cầu xuống một Client cụ thể:
-```csharp
-var response = await server.RequestAsync<IReqProto, IResProto>("topic", "VN-01", requestData, TimeSpan.FromSeconds(2));
-```
+### Unity Client
 
-Xử lý Request từ Client gửi lên (Đa luồng):
 ```csharp
-server.OnRequest<IReqProto, IResProto>("topic", incoming => 
-{
-    string clientRegion = incoming.regionId;
-    IReqProto request = incoming.request;
-    
-    return new IResProto { ... };
+var client = new NatifyClient("nats://localhost:4222", "UnityClient", "GrpA", "VN", "GameServer");
+
+client.OnMessage<Int32Value>("UpdateHealth", data => {
+    healthBar.SetValue(data.Value.Value); // Chạy trên Main Thread sau Tick()
 });
+
+void Update() {
+    client.Tick(); // Bắt buộc!
+}
+
+void OnDestroy() {
+    client.Dispose();
+}
 ```
 
----
+### Scale ngang (N instances cùng loại)
 
-### Giám sát Hệ thống (Telemetry & Triggers)
-
-Cả `NatifyClient` và `NatifyServer` đều có thuộc tính `.Trigger`, cho phép bạn truy xuất các chỉ số thời gian thực và cài đặt cảnh báo.
-
-**Xem chỉ số (VD: làm API Dashboard):**
 ```csharp
-long totalSent = server.Trigger.MessagesSent;
-double ramUsage = server.Trigger.ProcessMemoryMB;
-long dedupCacheSize = server.Trigger.CurrentDedupCacheSize;
+// Tất cả instance Router giống hệt constructor:
+var router = new NatifyServer("nats://localhost:4222", "Router", "RouterGroup", "*");
+
+// Tất cả instance Account giống hệt constructor:
+var account = new NatifyClientFast("nats://localhost:4222", "AccountService", "AccountGroup", "ALL", "Router");
+
+// Unity gửi event lên → NATS queue group "RouterGroup" → chỉ 1 Router instance nhận
+// Router gửi request xuống Account → NATS queue group "AccountGroup" → chỉ 1 Account instance nhận
 ```
 
-**Cài đặt Luật Cảnh Báo (Smart Triggers):**
-Trigger sử dụng luồng chạy ngầm độc lập (Cold Path), không làm chậm tốc độ mạng (Hot Path).
+### Giám sát
+
 ```csharp
-// Báo động nếu RAM quá 1.5 GB
 server.Trigger.RegisterTrigger(
     condition: t => t.ProcessMemoryMB > 1500,
-    action: t => Console.WriteLine($"[CẢNH BÁO OOM] RAM đang ở mức {t.ProcessMemoryMB} MB!"),
+    action: t => Console.WriteLine($"[OOM] RAM: {t.ProcessMemoryMB} MB!"),
     oneTime: false
-);
-
-// In log định kỳ sau mỗi 100.000 tin nhắn
-server.Trigger.RegisterTrigger(
-    condition: t => t.MessagesReceived % 100000 == 0 && t.MessagesReceived > 0,
-    action: t => Console.WriteLine($"Đã xử lý: {t.MessagesReceived} tin nhắn."),
 );
 ```
 
 ---
 
-### Quy ước Chủ đề (Routing Topics)
-Hệ thống sử dụng bộ định tuyến ngầm định trong `NatifyTopics`:
-- Client lắng nghe: `NatifyClient.<client_name>.<server_name>.<regionId>.<topic>`
-- Server lắng nghe: `NatifyServer.<server_name>.<client_name>.*.<topic>`
-- *(Ký tự `*` cho phép Server gom tập trung tin nhắn từ mọi Region vào chung một đầu mối xử lý).*
+## Changelog
 
----
-
-### Quản lý Vòng đời (Dispose & Graceful Shutdown)
-
-Hệ thống được thiết kế **Tắt Mềm (Graceful Shutdown)** để bảo vệ dữ liệu.
-Khi gọi `client.Dispose()` hoặc `server.Dispose()`:
-1. Van đầu vào bị khóa (Không nhận thêm lệnh `Publish` mới).
-2. Hệ thống sẽ đợi tối đa **2 giây** để các luồng ngầm gom nốt Batch cuối cùng và chờ nhận đủ `ACK` từ phía đối diện.
-3. Giải phóng bộ nhớ TimeWheel.
-4. An toàn đóng kết nối NATS.
-
-Bắt buộc phải gọi `.Dispose()` khi tắt ứng dụng hoặc khi đối tượng không còn được sử dụng để tránh Memory Leak.
-
-V 1.0.2
-    - Ra mắt `NatifyClientFast`: Phiên bản Client tối ưu tốc độ đa luồng dành riêng cho hệ thống Backend chạy ngầm (Tick-free).
-    - Cải thiện luồng Request xử lý tốt hơn ở mức cường độ lên tới hàng trăm ngàn tác vụ (200K RPS).
-V 1.0.1 
-    - fix request bị miss tin nhắn nếu client gửi liên tục nhiều request cùng lúc
+- **v1.0.2** — `NatifyClientFast` (Tick-free cho Backend). Cải thiện Request pipeline (200K RPS).
+- **v1.0.1** — Fix request miss khi gửi nhiều request liên tục.
