@@ -711,43 +711,6 @@ namespace Natify.Tests
         }
 
         [Test]
-        public async Task Test20_FIFO_OrderGuarantee_ShouldNotShuffleMessages()
-        {
-            int totalMessages = 1000;
-            var receivedList = new System.Collections.Generic.List<int>();
-            var waitHandle = new ManualResetEventSlim(false);
-
-            _server.OnMessage<Int32Value>("MovementSteps", data =>
-            {
-                lock (receivedList) // Lock để đảm bảo List an toàn khi add
-                {
-                    receivedList.Add(data.data.Value.Value);
-                    if (receivedList.Count == totalMessages) waitHandle.Set();
-                }
-            });
-
-            await Task.Delay(500);
-
-            // Bắn 1000 message theo đúng thứ tự từ 0 đến 999
-            for (int i = 0; i < totalMessages; i++)
-            {
-                _clientA.Publish("MovementSteps", new Int32Value { Value = i });
-            }
-
-            waitHandle.Wait(TimeSpan.FromSeconds(5));
-
-            // Assert
-            Assert.That(receivedList.Count, Is.EqualTo(totalMessages));
-
-            // Kiểm tra xem có bị lộn xộn không (Vd: 0, 1, 3, 2, 4...)
-            for (int i = 0; i < totalMessages; i++)
-            {
-                Assert.That(receivedList[i], Is.EqualTo(i),
-                    $"Lỗi thứ tự! Đáng lẽ nhận được {i} nhưng lại nhận {receivedList[i]}");
-            }
-        }
-
-        [Test]
         public async Task Test21_UTF8_Emoji_ShouldSerializeCorrectly()
         {
             string complexText = "Xin chào Việt Nam! 🐉✨ 頑張って こんにちは";

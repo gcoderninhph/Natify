@@ -206,7 +206,8 @@ namespace Natify
                         {
                             if (unacked.RetryCount >= _maxRetries)
                             {
-                                LogError($"[NatifyClientFast] Drop gói tin {unacked.BatchId} vì vượt quá số lần Retry.");
+                                LogError(
+                                    $"[NatifyClientFast] Drop gói tin {unacked.BatchId} vì vượt quá số lần Retry.");
                                 _unackedMessages.TryRemove(kvp.Key, out _);
                                 continue;
                             }
@@ -326,20 +327,34 @@ namespace Natify
         {
             OnMessage($"Rep-{_instanceId}", data =>
             {
-                if (_replyTasks.TryRemove(data.RepId, out var task))
+                try
                 {
-                    task.task.SetResult(data.Value);
-                    task.ct.Dispose();
+                    if (_replyTasks.TryRemove(data.RepId, out var task))
+                    {
+                        task.task.SetResult(data.Value);
+                        task.ct.Dispose();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[NatifyClient] Error OnMessage Reply : {ex.Message}");
                 }
             }, null);
         }
-        
+
         public void OnMessage<T>(string topic, Action<Data<T>> callback) where T : IMessage, new()
         {
             OnMessage(topic, data =>
             {
-                var result = NatifySerializer.Deserialize<T>(data.Value, data.Value.Length);
-                callback(new Data<T>(result, data.InstanceId, data.ReqId, data.RepId));
+                try
+                {
+                    var result = NatifySerializer.Deserialize<T>(data.Value, data.Value.Length);
+                    callback(new Data<T>(result, data.InstanceId, data.ReqId, data.RepId));
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[NatifyClient] Error OnMessage : {ex.Message}");
+                }
             }, null);
         }
 
@@ -347,8 +362,15 @@ namespace Natify
         {
             OnMessage(topic, null, async data =>
             {
-                var result = NatifySerializer.Deserialize<T>(data.Value, data.Value.Length);
-                await callback(new Data<T>(result, data.InstanceId, data.ReqId, data.RepId));
+                try
+                {
+                    var result = NatifySerializer.Deserialize<T>(data.Value, data.Value.Length);
+                    await callback(new Data<T>(result, data.InstanceId, data.ReqId, data.RepId));
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[NatifyClient] Error OnMessage : {ex.Message}");
+                }
             });
         }
 

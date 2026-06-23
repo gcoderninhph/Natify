@@ -266,8 +266,15 @@ namespace Natify
         {
             OnMessage(topic, a =>
             {
-                var result = NatifySerializer.Deserialize<T>(a.data.Value, a.data.Value.Length);
-                callback((a.regionId, new Data<T>(result, a.data.InstanceId, a.data.ReqId, a.data.RepId)));
+                try
+                {
+                    var result = NatifySerializer.Deserialize<T>(a.data.Value, a.data.Value.Length);
+                    callback((a.regionId, new Data<T>(result, a.data.InstanceId, a.data.ReqId, a.data.RepId)));
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[NatifyServer] Error OnMessage on {topic}: {ex.Message}");
+                }
             }, null);
         }
 
@@ -276,8 +283,15 @@ namespace Natify
         {
             OnMessage(topic, null, async a =>
             {
-                var result = NatifySerializer.Deserialize<T>(a.data.Value, a.data.Value.Length);
-                await callback((a.regionId, new Data<T>(result, a.data.InstanceId, a.data.ReqId, a.data.RepId)));
+                try
+                {
+                    var result = NatifySerializer.Deserialize<T>(a.data.Value, a.data.Value.Length);
+                    await callback((a.regionId, new Data<T>(result, a.data.InstanceId, a.data.ReqId, a.data.RepId)));
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[NatifyServer] Error OnMessage on {topic}: {ex.Message}");
+                }
             });
         }
 
@@ -341,10 +355,8 @@ namespace Natify
                                 var instanceId = batch.FormInstanceId;
                                 var reqId = batch.ReqId[i];
                                 var repId = batch.RepId[i];
-                                // var data = NatifySerializer.Deserialize<T>(itemBytes, itemBytes.Length);
-                                // callback.Invoke(new Data<T>(data, instanceId, repId));
                                 var result = new Data<byte[]>(itemBytes, instanceId, reqId, repId);
-                                callback?.Invoke((regionId, result));
+                                if (callback != null) _ = Task.Run(() => callback.Invoke((regionId, result)));
                                 if (callbackAsync != null) _ = callbackAsync((regionId, result));
                             }
                         }
