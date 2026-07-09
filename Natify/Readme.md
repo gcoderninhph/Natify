@@ -34,10 +34,10 @@ _connection.SubscribeAsync<byte[]>(subject, queueGroup: _groupName, ...)
 **Ví dụ Router scale ngang:**
 ```csharp
 // Router instance 1
-new NatifyServer("nats://localhost:4222", "Router", "RouterGroup", "*");
+new NatifyServer("nats://localhost:4222", "Router", "RouterGroup", "GameClient");
 
 // Router instance 2 — cùng serverName + groupName
-new NatifyServer("nats://localhost:4222", "Router", "RouterGroup", "*");
+new NatifyServer("nats://localhost:4222", "Router", "RouterGroup", "GameClient");
 
 // NATS chỉ gửi mỗi message từ Unity đến 1 trong 2 instance
 ```
@@ -144,7 +144,7 @@ public class NatifyServer : IDisposable
 
 | Member | Signature |
 |--------|-----------|
-| **ctor** | `NatifyServer(string url, string serverName, string groupName, string clientNameToConnect)` |
+| **ctor** | `NatifyServer(string url, string serverName, string groupName, string clientNameToConnect, Config? config = null)` |
 | `Publish` | `void Publish<T>(string topic, string regionId, T msg) where T : IMessage` |
 | `OnMessage` | `void OnMessage<T>(string topic, Action<(string regionId, Data<T> data)> cb) where T : IMessage, new()` |
 | `OnMessage` | `void OnMessage<T>(string topic, Func<(string regionId, Data<T> data), Task> cb)` |
@@ -158,7 +158,7 @@ public class NatifyServer : IDisposable
 - `url` — NATS URL (vd: `"nats://localhost:4222"`)
 - `serverName` — Định danh server này (xuất hiện trong NATS subject)
 - `groupName` — **NATS queue group** → dùng chung cho tất cả instance cùng loại để scale ngang
-- `clientNameToConnect` — Tên client pattern để listen. Dùng `"*"` để match mọi client.
+- `clientNameToConnect` — Tên chính xác của client mà server giao tiếp. Vì server dùng giá trị này trong cả subscribe VÀ publish subject nên **không được dùng wildcard `"*"`** (sẽ khiến publish/ACK gửi sai subject). Cần đặt trùng với `clientName` của `NatifyClient`/`NatifyClientFast` tương ứng.
 
 ### NatifyClient (Unity)
 
@@ -168,7 +168,7 @@ public class NatifyClient : IDisposable
 
 | Member | Signature |
 |--------|-----------|
-| **ctor** | `NatifyClient(string url, string clientName, string groupName, string regionId, string serverNameToConnect)` |
+| **ctor** | `NatifyClient(string url, string clientName, string groupName, string regionId, string serverNameToConnect, Config? config = null)` |
 | `Publish` | `void Publish<T>(string topic, T msg) where T : IMessage` |
 | `OnMessage` | `void OnMessage<T>(string topic, Action<Data<T>> cb) where T : IMessage, new()` |
 | `OnMessage` | `void OnMessage<T>(string topic, Func<Data<T>, Task> cb)` |
@@ -234,6 +234,35 @@ server.OnMessage<MyMsg>("topic", tuple => {
 
 Triggers được đánh giá mỗi 500ms trên ThreadPool.
 
+### Config — Micro-Batching Tuning
+
+Tuỳ chỉnh tham số gom batch. Cả `NatifyServer`, `NatifyClient`, `NatifyClientFast` đều nhận `Config? config = null` ở tham số cuối constructor.
+
+```csharp
+public class Config
+{
+    public int MaxCount = 1000;                    // Số message tối đa trong 1 batch
+    public int MaxSize = 50 * 1024;                // Dung lượng tối đa trong 1 batch (50 KB)
+    public TimeSpan MaxWait = TimeSpan.FromMilliseconds(50); // Thời gian chờ tối đa trước khi flush
+}
+```
+
+| Property | Type | Default | Mô tả |
+|----------|------|---------|-------|
+| `MaxCount` | int | 1000 | Số messages tối đa trước khi flush batch |
+| `MaxSize` | int | 51200 | Payload tối đa (bytes) trước khi flush batch |
+| `MaxWait` | TimeSpan | 50ms | Thời gian chờ tối đa từ message đầu tiên đến khi flush |
+
+**Ví dụ:**
+```csharp
+var config = new Config {
+    MaxCount = 500,
+    MaxSize = 25 * 1024,
+    MaxWait = TimeSpan.FromMilliseconds(30)
+};
+var server = new NatifyServer("nats://localhost:4222", "GameServer", "SrvGroup", "Client1", config);
+```
+
 ---
 
 ## Code Examples
@@ -242,7 +271,7 @@ Triggers được đánh giá mỗi 500ms trên ThreadPool.
 
 ```csharp
 // Server
-var server = new NatifyServer("nats://localhost:4222", "GameServer", "SrvGroup", "*");
+var server = new NatifyServer("nats://localhost:4222", "GameServer", "SrvGroup", "Client1");
 server.OnMessage<StringValue>("Chat", tuple => {
     Console.WriteLine($"[{tuple.regionId}] {tuple.data.Value.Value}");
 });
@@ -288,7 +317,7 @@ void OnDestroy() {
 
 ```csharp
 // Tất cả instance Router giống hệt constructor:
-var router = new NatifyServer("nats://localhost:4222", "Router", "RouterGroup", "*");
+var router = new NatifyServer("nats://localhost:4222", "Router", "RouterGroup", "AccountService");
 
 // Tất cả instance Account giống hệt constructor:
 var account = new NatifyClientFast("nats://localhost:4222", "AccountService", "AccountGroup", "ALL", "Router");
