@@ -36,9 +36,9 @@ namespace Natify
 
         public NatifyClientTriggers Trigger { get; } = new();
 
-        private const int MaxCount = 1000;
-        private const int MaxSize = 50 * 1024; // 50 KB
-        private readonly TimeSpan MaxWait = TimeSpan.FromMilliseconds(50);
+        private int _maxCount = 1000;
+        private int _maxSize = 50 * 1024; // 50 KB
+        private TimeSpan _maxWait = TimeSpan.FromMilliseconds(50);
 
         private readonly Channel<(string Subject, byte[] Payload, string MessageType, string ReqId, string RepId)>
             _batchChannel =
@@ -47,8 +47,15 @@ namespace Natify
         private readonly CancellationTokenSource _cts;
 
         public NatifyClientFast(string url, string clientName, string groupName, string regionId,
-            string serverNameToConnect)
+            string serverNameToConnect, Config? config = null)
         {
+            if (config != null)
+            {
+                _maxCount = config.MaxCount;
+                _maxSize = config.MaxSize;
+                _maxWait = config.MaxWait;
+            }
+
             _clientName = clientName;
             _groupName = groupName;
             _regionId = regionId;
@@ -101,10 +108,10 @@ namespace Natify
 
                 var batchStartTime = DateTime.UtcNow;
 
-                while (currentCount < MaxCount && currentSizeBytes < MaxSize)
+                while (currentCount < _maxCount && currentSizeBytes < _maxSize)
                 {
                     var elapsed = DateTime.UtcNow - batchStartTime;
-                    if (elapsed >= MaxWait)
+                    if (elapsed >= _maxWait)
                     {
                         break;
                     }
@@ -128,7 +135,7 @@ namespace Natify
                     }
                     else
                     {
-                        var timeLeft = MaxWait - elapsed;
+                        var timeLeft = _maxWait - elapsed;
 
                         try
                         {

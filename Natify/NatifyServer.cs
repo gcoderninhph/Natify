@@ -27,9 +27,9 @@ namespace Natify
             _replyTasks = new();
 
         private Task _batchWorkerTask;
-        private const int MaxCount = 1000;
-        private const int MaxSize = 50 * 1024; // 50 KB
-        private readonly TimeSpan MaxWait = TimeSpan.FromMilliseconds(50);
+        private int _maxCount = 1000;
+        private int _maxSize = 50 * 1024; // 50 KB
+        private TimeSpan _maxWait = TimeSpan.FromMilliseconds(50);
 
         private readonly ConcurrentDictionary<string, UnackedMessage> _unackedMessages = new();
         private readonly TimeSpan _ackTimeout = TimeSpan.FromMilliseconds(100);
@@ -46,8 +46,16 @@ namespace Natify
         private Task? _retryWorkerTask;
         private Task? _ackListenerTask;
 
-        public NatifyServer(string url, string serverName, string groupName, string clientNameToConnect)
+        public NatifyServer(string url, string serverName, string groupName, string clientNameToConnect,
+            Config? config = null)
         {
+            if (config != null)
+            {
+                _maxCount = config.MaxCount;
+                _maxSize = config.MaxSize;
+                _maxWait = config.MaxWait;
+            }
+
             _instanceId = Guid.NewGuid().ToString();
             _serverName = serverName;
             _groupName = groupName;
@@ -153,10 +161,10 @@ namespace Natify
                 int currentSizeBytes = 0;
                 var batchStartTime = DateTime.UtcNow;
 
-                while (currentCount < MaxCount && currentSizeBytes < MaxSize)
+                while (currentCount < _maxCount && currentSizeBytes < _maxSize)
                 {
                     var elapsed = DateTime.UtcNow - batchStartTime;
-                    if (elapsed >= MaxWait) break;
+                    if (elapsed >= _maxWait) break;
 
                     if (reader.TryRead(out var item))
                     {
@@ -177,7 +185,7 @@ namespace Natify
                     }
                     else
                     {
-                        var timeLeft = MaxWait - elapsed;
+                        var timeLeft = _maxWait - elapsed;
                         try
                         {
                             using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
