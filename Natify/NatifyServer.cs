@@ -3,6 +3,7 @@ using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Threading;
+using Gcoder.Collections;
 using System.Threading.Channels;
 using System.Threading.Tasks;
 using Google.Protobuf;
@@ -17,7 +18,7 @@ namespace Natify
         private readonly string _instanceId;
 
         private readonly ConcurrentDictionary<string, byte> _processedMessages = new();
-        private readonly TimedSortedSet<string, byte> _messageTtlWheel = new();
+        private readonly ITimedCollection<string, byte> _messageTtlWheel = ITimedCollection<string, byte>.NewTimeSortSet();
 
         private readonly Channel<(string Subject, byte[] Payload, string MessageType, string ReqId, string RepId)>
             _batchChannel =
@@ -341,8 +342,7 @@ namespace Natify
                             if (_processedMessages.TryAdd(messageId, 1))
                             {
                                 Trigger.AddDedupItem();
-                                long expireTimeMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + 10_000;
-                                _messageTtlWheel.AddOrUpdate(messageId, 1, expireTimeMs);
+                                _messageTtlWheel.AddOrUpdate(messageId, 1, TimeSpan.FromSeconds(10));
                             }
                             else
                             {

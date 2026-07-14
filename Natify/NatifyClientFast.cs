@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Channels;
+using Gcoder.Collections;
 using System.Threading.Tasks;
 using Google.Protobuf;
 using NATS.Client.Core;
@@ -29,7 +30,7 @@ namespace Natify
         private Task? _ackListenerTask;
 
         private readonly ConcurrentDictionary<string, byte> _processedMessages;
-        private readonly TimedSortedSet<string, byte> _messageTtlWheel;
+        private readonly ITimedCollection<string, byte> _messageTtlWheel;
 
         private readonly ConcurrentDictionary<string, (TaskCompletionSource<byte[]> task, CancellationTokenSource ct)>
             _replyTasks = new();
@@ -75,7 +76,7 @@ namespace Natify
             _instanceId = Guid.NewGuid().ToString("N");
 
             _processedMessages = new ConcurrentDictionary<string, byte>();
-            _messageTtlWheel = new TimedSortedSet<string, byte>();
+            _messageTtlWheel = ITimedCollection<string, byte>.NewTimeSortSet();
             _messageTtlWheel.OnExpired += OnMessagesExpired;
 
             var opts = new NatsOpts
@@ -287,8 +288,7 @@ namespace Natify
                             if (_processedMessages.TryAdd(messageId, 1))
                             {
                                 Trigger.AddDedupItem();
-                                long expireTimeMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + 10_000;
-                                _messageTtlWheel.AddOrUpdate(messageId, 1, expireTimeMs);
+                                _messageTtlWheel.AddOrUpdate(messageId, 1, TimeSpan.FromSeconds(10));
                             }
                             else
                             {
