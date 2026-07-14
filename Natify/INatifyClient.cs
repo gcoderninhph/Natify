@@ -2,8 +2,6 @@
 using System.Threading.Tasks;
 using Google.Protobuf;
 
-#nullable enable
-
 namespace Natify
 {
     public interface INatifyClient : IAsyncDisposable

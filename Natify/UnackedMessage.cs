@@ -4,9 +4,9 @@ namespace Natify
 {
     public class UnackedMessage
     {
-        public string Subject { get; set; }
-        public byte[] Payload { get; set; }
-        public string BatchId { get; set; }
+        public string? Subject { get; set; }
+        public byte[]? Payload { get; set; }
+        public string? BatchId { get; set; }
         public DateTime LastSent { get; set; }
         public int RetryCount { get; set; }
     }

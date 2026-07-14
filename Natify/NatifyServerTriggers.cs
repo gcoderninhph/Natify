@@ -66,11 +66,11 @@ namespace Natify
         // ==========================================
 
         // Cấu trúc lưu trữ 1 Rule (Luật kích hoạt)
-        private class TriggerRule
+        private class TriggerRule(Func<NatifyServerTriggers, bool> condition, Action<NatifyServerTriggers> callback, bool isOneTime)
         {
-            public Func<NatifyServerTriggers, bool> Condition { get; set; }
-            public Action<NatifyServerTriggers> Callback { get; set; }
-            public bool IsOneTime { get; set; } // Nếu true, kích hoạt xong sẽ tự xóa
+            public Func<NatifyServerTriggers, bool> Condition { get; } = condition;
+            public Action<NatifyServerTriggers> Callback { get; } = callback;
+            public bool IsOneTime { get; } = isOneTime;
         }
 
         private readonly ConcurrentDictionary<Guid, TriggerRule> _rules = new();
@@ -94,7 +94,7 @@ namespace Natify
             bool oneTime = false)
         {
             var ruleId = Guid.NewGuid();
-            var rule = new TriggerRule { Condition = condition, Callback = action, IsOneTime = oneTime };
+            var rule = new TriggerRule(condition, action, oneTime);
             _rules.TryAdd(ruleId, rule);
             return ruleId;
         }

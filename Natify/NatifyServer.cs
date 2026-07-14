@@ -9,8 +9,6 @@ using System.Threading.Tasks;
 using Google.Protobuf;
 using NATS.Client.Core;
 
-#nullable enable
-
 namespace Natify
 {
     internal class NatifyServer : INatifyServer
@@ -27,7 +25,7 @@ namespace Natify
         private readonly ConcurrentDictionary<string, (TaskCompletionSource<byte[]> task, CancellationTokenSource ct)>
             _replyTasks = new();
 
-        private Task _batchWorkerTask;
+        private Task? _batchWorkerTask;
         private int _maxCount = 1000;
         private int _maxSize = 50 * 1024; // 50 KB
         private TimeSpan _maxWait = TimeSpan.FromMilliseconds(50);
@@ -132,7 +130,7 @@ namespace Natify
                             {
                                 if (unacked.RetryCount >= _maxRetries)
                                 {
-                                    Console.WriteLine(
+                                    NatifyLogger.Error(
                                         $"[NatifyServer] Drop gói tin {unacked.BatchId} gửi tới Client vì vượt quá Retry.");
                                     _unackedMessages.TryRemove(kvp.Key, out _);
                                     continue;
@@ -142,7 +140,7 @@ namespace Natify
                                 unacked.RetryCount++;
 
                                 var headers = new NatsHeaders { ["Natify-BatchId"] = unacked.BatchId };
-                                await _connection.PublishAsync(unacked.Subject, unacked.Payload, headers: headers,
+                                await _connection.PublishAsync(unacked.Subject!, unacked.Payload!, headers: headers,
                                     cancellationToken: _cts.Token);
                             }
                         }
@@ -185,7 +183,7 @@ namespace Natify
                         batch.ReqId.Add(item.ReqId);
                         batch.MsgType.Add(item.MessageType);
                         batch.RepId.Add(item.RepId);
-                        batch.FormInstanceId = _instanceId;
+                        batch.FromInstanceId = _instanceId;
 
                         currentCount++;
                         currentSizeBytes += item.Payload.Length;
@@ -288,7 +286,7 @@ namespace Natify
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"[NatifyServer] Error OnMessage on {topic}: {ex.Message}");
+                    NatifyLogger.Error($"[NatifyServer] Error OnMessage on {topic}: {ex.Message}");
                 }
             }, null);
         }
@@ -305,7 +303,7 @@ namespace Natify
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"[NatifyServer] Error OnMessage on {topic}: {ex.Message}");
+                    NatifyLogger.Error($"[NatifyServer] Error OnMessage on {topic}: {ex.Message}");
                 }
             });
         }
@@ -366,7 +364,7 @@ namespace Natify
                             for (var i = 0; i < batch.Payloads.Count; i++)
                             {
                                 var itemBytes = batch.Payloads[i].ToByteArray();
-                                var instanceId = batch.FormInstanceId;
+                                var instanceId = batch.FromInstanceId;
                                 var reqId = batch.ReqId[i];
                                 var repId = batch.RepId[i];
                                 var result = new Data<byte[]>(itemBytes, instanceId, reqId, repId);
@@ -376,7 +374,7 @@ namespace Natify
                         }
                         catch (Exception ex)
                         {
-                            Console.WriteLine($"[NatifyServer] Error Unpacking Batch on {topic}: {ex.Message}");
+                            NatifyLogger.Error($"[NatifyServer] Error Unpacking Batch on {topic}: {ex.Message}");
                         }
                     }
                 }
@@ -403,13 +401,12 @@ namespace Natify
                 // Lắng nghe sự kiện token bị hủy (hết giờ)
                 cancellationTokenSource.Token.Register(() =>
                 {
-                    // Xóa task khỏi danh sách chờ để dọn dẹp RAM
-                    if (_replyTasks.TryRemove(reqId, out _))
+                    if (_replyTasks.TryRemove(reqId, out var removed))
                     {
-                        // Ép Task phải ném ra lỗi TimeoutException ngay lập tức
-                        taskCompletionSource.TrySetException(
+                        removed.task.TrySetException(
                             new TimeoutException(
                                 $"[Natify] Request {reqId} timed out after {timeout.TotalMilliseconds}ms."));
+                        removed.ct.Dispose();
                     }
                 });
                 // --- KẾT THÚC ĐOẠN CODE CẦN THÊM ---
@@ -496,11 +493,35 @@ namespace Natify
             {
             }
 
+            foreach (var kvp in _replyTasks)
+            {
+                if (_replyTasks.TryRemove(kvp.Key, out var task))
+                {
+                    task.task.TrySetException(new ObjectDisposedException(nameof(NatifyServer)));
+                    task.ct.Dispose();
+                }
+            }
+
             // BƯỚC 3: Đợi các Task chạy ngầm kết thúc hoàn toàn
             try
             {
-                await Task.WhenAny(Task.WhenAll(_retryWorkerTask!, _ackListenerTask!),
-                    Task.Delay(TimeSpan.FromSeconds(1)));
+                var tasks = new List<Task>();
+
+                if (_retryWorkerTask != null)
+                    tasks.Add(_retryWorkerTask);
+
+                if (_ackListenerTask != null)
+                    tasks.Add(_ackListenerTask);
+
+                if (tasks.Count > 0)
+                {
+                    var allTasks = Task.WhenAll(tasks);
+
+                    if (await Task.WhenAny(allTasks, Task.Delay(TimeSpan.FromSeconds(1))) == allTasks)
+                    {
+                        await allTasks;
+                    }
+                }
             }
             catch
             {

@@ -1032,7 +1032,7 @@ namespace Natify.Tests
             batchMsg.ReqId.Add(fakeMessageId);
             batchMsg.MsgType.Add("PUB");
             batchMsg.RepId.Add(string.Empty);
-            batchMsg.FormInstanceId = "VN-01";
+            batchMsg.FromInstanceId = "VN-01";
 
             var (batchBuffer, batchLength) = NatifySerializer.Serialize(batchMsg);
             var exactBatchData = new byte[batchLength];
@@ -1282,7 +1282,7 @@ namespace Natify.Tests
             batchMsg.ReqId.Add(fixedMessageId);
             batchMsg.MsgType.Add("PUB");
             batchMsg.RepId.Add(string.Empty);
-            batchMsg.FormInstanceId = "VN-01";
+            batchMsg.FromInstanceId = "VN-01";
 
             var (batchBuffer, batchLength) = NatifySerializer.Serialize(batchMsg);
             var exactBatchData = new byte[batchLength];

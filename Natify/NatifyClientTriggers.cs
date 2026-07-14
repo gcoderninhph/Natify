@@ -46,11 +46,11 @@ namespace Natify
         }
 
         // --- HỆ THỐNG TRIGGER THÔNG MINH ---
-        private class TriggerRule
+        private class TriggerRule(Func<NatifyClientTriggers, bool> condition, Action<NatifyClientTriggers> callback, bool isOneTime)
         {
-            public Func<NatifyClientTriggers, bool> Condition { get; set; }
-            public Action<NatifyClientTriggers> Callback { get; set; }
-            public bool IsOneTime { get; set; }
+            public Func<NatifyClientTriggers, bool> Condition { get; } = condition;
+            public Action<NatifyClientTriggers> Callback { get; } = callback;
+            public bool IsOneTime { get; } = isOneTime;
         }
 
         private readonly ConcurrentDictionary<Guid, TriggerRule> _rules = new();
@@ -65,7 +65,7 @@ namespace Natify
         public Guid RegisterTrigger(Func<NatifyClientTriggers, bool> condition, Action<NatifyClientTriggers> action, bool oneTime = false)
         {
             var ruleId = Guid.NewGuid();
-            var rule = new TriggerRule { Condition = condition, Callback = action, IsOneTime = oneTime };
+            var rule = new TriggerRule(condition, action, oneTime);
             _rules.TryAdd(ruleId, rule);
             return ruleId;
         }
@@ -90,6 +90,7 @@ namespace Natify
                     }
                 }
                 catch (OperationCanceledException) { break; }
+                catch (Exception ex) { NatifyLogger.Error($"[NatifyClientTriggers] Monitor loop error: {ex.Message}"); }
             }
         }
 

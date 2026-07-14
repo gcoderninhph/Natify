@@ -8,12 +8,6 @@ using System.Threading.Tasks;
 using Google.Protobuf;
 using NATS.Client.Core;
 
-#nullable enable
-
-#if UNITY_5_3_OR_NEWER
-using UnityEngine;
-#endif
-
 namespace Natify
 {
     internal class NatifyClient : INatifyClient
@@ -138,7 +132,7 @@ namespace Natify
                         batch.ReqId.Add(item.ReqId);
                         batch.MsgType.Add(item.MessageType);
                         batch.RepId.Add(item.RepId);
-                        batch.FormInstanceId = _instanceId;
+                        batch.FromInstanceId = _instanceId;
 
                         currentCount++;
                         currentSizeBytes += item.Payload.Length;
@@ -233,7 +227,7 @@ namespace Natify
                             unacked.RetryCount++;
 
                             var headers = new NatsHeaders { ["Natify-BatchId"] = unacked.BatchId };
-                            await _connection.PublishAsync(unacked.Subject, unacked.Payload, headers: headers,
+                            await _connection.PublishAsync(unacked.Subject!, unacked.Payload!, headers: headers,
                                 cancellationToken: _cts.Token);
                         }
                     }
@@ -321,7 +315,7 @@ namespace Natify
                                 for (var i = 0; i < batch.Payloads.Count; i++)
                                 {
                                     var itemBytes = batch.Payloads[i].ToByteArray();
-                                    var instanceId = batch.FormInstanceId;
+                                    var instanceId = batch.FromInstanceId;
                                     var reqId = batch.ReqId[i];
                                     var repId = batch.RepId[i];
                                     var result = new Data<byte[]>(itemBytes, instanceId, reqId, repId);
@@ -396,10 +390,11 @@ namespace Natify
 
                 cancellationTokenSource.Token.Register(() =>
                 {
-                    if (_replyTasks.TryRemove(reqId, out _))
+                    if (_replyTasks.TryRemove(reqId, out var removed))
                     {
-                        taskCompletionSource.TrySetException(new TimeoutException(
+                        removed.task.TrySetException(new TimeoutException(
                             $"[NatifyClient] Request {reqId} timed out after {timeout.TotalMilliseconds}ms."));
+                        removed.ct.Dispose();
                     }
                 });
 
@@ -446,13 +441,9 @@ namespace Natify
             }
         }
 
-        private void LogError(string message)
+        private static void LogError(string message)
         {
-#if UNITY_5_3_OR_NEWER
-            UnityEngine.Debug.LogError(message);
-#else
-            Console.WriteLine(message);
-#endif
+            NatifyLogger.Error(message);
         }
 
         public async ValueTask DisposeAsync()
@@ -490,6 +481,15 @@ namespace Natify
             {
             }
 
+            foreach (var kvp in _replyTasks)
+            {
+                if (_replyTasks.TryRemove(kvp.Key, out var task))
+                {
+                    task.task.TrySetException(new ObjectDisposedException(nameof(NatifyClient)));
+                    task.ct.Dispose();
+                }
+            }
+
             try
             {
                 var tasks = new List<Task>();
@@ -512,6 +512,11 @@ namespace Natify
             }
 
             Trigger.Dispose();
+
+            while (_mainThreadActions.TryDequeue(out var action))
+            {
+                try { action.Invoke(); } catch (Exception ex) { NatifyLogger.Error($"[NatifyClient] Drain error: {ex.Message}"); }
+            }
 
             try
             {

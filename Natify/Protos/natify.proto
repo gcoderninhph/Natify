@@ -7,5 +7,5 @@ message NatifyBatch {
   repeated string reqId = 2;
   repeated string msgType = 3;
   repeated string repId = 4;
-  string formInstanceId = 5;
+  string fromInstanceId = 5;
 }
