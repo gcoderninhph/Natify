@@ -11,7 +11,7 @@ using NATS.Client.Core;
 
 namespace Natify
 {
-    public class NatifyClientFast : IDisposable
+    public class NatifyClientFast : INatifyClient
     {
         private readonly ConcurrentDictionary<string, UnackedMessage> _unackedMessages = new();
         private readonly TimeSpan _ackTimeout = TimeSpan.FromMilliseconds(100);
@@ -23,10 +23,10 @@ namespace Natify
         private readonly string _instanceId;
         private bool _isDisposed = false;
         private readonly int _maxRetries = 10;
-        private Task _batchWorkerTask;
+        private Task? _batchWorkerTask;
 
-        private Task _retryWorkerTask;
-        private Task _ackListenerTask;
+        private Task? _retryWorkerTask;
+        private Task? _ackListenerTask;
 
         private readonly ConcurrentDictionary<string, byte> _processedMessages;
         private readonly TimedSortedSet<string, byte> _messageTtlWheel;
@@ -44,9 +44,21 @@ namespace Natify
             _batchChannel =
                 Channel.CreateUnbounded<(string, byte[], string, string, string)>();
 
-        private readonly CancellationTokenSource _cts;
+        private CancellationTokenSource _cts;
 
-        public NatifyClientFast(string url, string clientName, string groupName, string regionId,
+        public static async Task<INatifyClient> Create(string url, string clientName, string groupName,
+            string regionId,
+            string serverNameToConnect, Config? config = null)
+        {
+            var na = new NatifyClientFast(url, clientName, groupName, regionId, serverNameToConnect, config);
+            await na._connection.ConnectAsync();
+            na.StartReliableFeatures();
+            na.StartBatchWorker();
+            na.OnMessageRep();
+            return na;
+        }
+
+        private NatifyClientFast(string url, string clientName, string groupName, string regionId,
             string serverNameToConnect, Config? config = null)
         {
             if (config != null)
@@ -71,14 +83,7 @@ namespace Natify
                 Url = url
             };
             _connection = new NatsConnection(opts);
-
-            _connection.ConnectAsync().AsTask().GetAwaiter().GetResult();
-
             _cts = new CancellationTokenSource();
-
-            StartReliableFeatures();
-            StartBatchWorker();
-            OnMessageRep();
         }
 
         private void OnMessagesExpired(IReadOnlyList<(string Key, byte Value)> expiredItems)
@@ -440,7 +445,7 @@ namespace Natify
             Console.WriteLine(message);
         }
 
-        public void Dispose()
+        public async ValueTask DisposeAsync()
         {
             if (_isDisposed) return;
             _isDisposed = true;
@@ -451,17 +456,21 @@ namespace Natify
             {
                 try
                 {
-                    _batchWorkerTask.Wait(TimeSpan.FromSeconds(2));
+                    if (await Task.WhenAny(_batchWorkerTask, Task.Delay(TimeSpan.FromSeconds(2))) == _batchWorkerTask)
+                    {
+                        await _batchWorkerTask; // Ném exception nếu task bị lỗi
+                    }
                 }
                 catch
                 {
+                    //
                 }
             }
 
             var waitStartTime = DateTime.UtcNow;
             while ((!_unackedMessages.IsEmpty) && (DateTime.UtcNow - waitStartTime).TotalSeconds < 2)
             {
-                Thread.Sleep(50);
+                await Task.Delay(50);
             }
 
             try
@@ -470,29 +479,40 @@ namespace Natify
             }
             catch
             {
+                //
             }
 
             try
             {
-                var tasksToWait = new List<Task>();
-                if (_retryWorkerTask != null) tasksToWait.Add(_retryWorkerTask);
-                if (_ackListenerTask != null) tasksToWait.Add(_ackListenerTask);
+                var tasks = new List<Task>();
 
-                if (tasksToWait.Count > 0)
-                    Task.WaitAll(tasksToWait.ToArray(), TimeSpan.FromSeconds(1));
+                if (_retryWorkerTask != null)
+                    tasks.Add(_retryWorkerTask);
+
+                if (_ackListenerTask != null)
+                    tasks.Add(_ackListenerTask);
+
+                var allTasks = Task.WhenAll(tasks);
+
+                if (await Task.WhenAny(allTasks, Task.Delay(TimeSpan.FromSeconds(1))) == allTasks)
+                {
+                    await allTasks;
+                }
             }
             catch
             {
+                //
             }
 
             Trigger.Dispose();
 
             try
             {
-                _connection.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                await _connection.DisposeAsync();
             }
             catch
             {
+                //
             }
 
             _messageTtlWheel.OnExpired -= OnMessagesExpired;
