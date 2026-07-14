@@ -11,6 +11,8 @@
         <Description>Micro-batching library for NATS messaging with deduplication, TTL-based dedup wheel, reliable ACK/Retry, and zero-copy serialization.</Description>
         <PackageTags>nats;batching;messaging;pubsub</PackageTags>
         <PackageLicenseExpression>MIT</PackageLicenseExpression>
+        <GenerateDocumentationFile>true</GenerateDocumentationFile>
+        <NoWarn>$(NoWarn);CS1591</NoWarn>
     </PropertyGroup>
 
     <ItemGroup>
