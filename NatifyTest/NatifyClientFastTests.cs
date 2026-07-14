@@ -262,9 +262,7 @@ namespace NatifyTest
             batch.RepId.Add("");
             batch.MsgType.Add("PUB");
 
-            var (buf, len) = NatifySerializer.Serialize(batch);
-            var payload = buf.Take(len).ToArray();
-            System.Buffers.ArrayPool<byte>.Shared.Return(buf);
+            var payload = NatifySerializer.SerializeSimple(batch);
 
             string subject = NatifyTopics.GetClientListenSubject("TestClientFast", "TestServer", "Region1", "Dupe");
             var headers = new NatsHeaders { ["Natify-BatchId"] = "Batch123" };

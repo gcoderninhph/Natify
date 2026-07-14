@@ -1024,9 +1024,7 @@ namespace Natify.Tests
             var batchMsg = new NatifyBatch();
             var payload = new StringValue { Value = "Gold + 1000" };
 
-            var (buffer, length) = NatifySerializer.Serialize(payload);
-            var exactData = new byte[length];
-            Array.Copy(buffer, exactData, length);
+            var exactData = NatifySerializer.SerializeSimple(payload);
 
             batchMsg.Payloads.Add(Google.Protobuf.ByteString.CopyFrom(exactData));
             batchMsg.ReqId.Add(fakeMessageId);
@@ -1034,9 +1032,7 @@ namespace Natify.Tests
             batchMsg.RepId.Add(string.Empty);
             batchMsg.FromInstanceId = "VN-01";
 
-            var (batchBuffer, batchLength) = NatifySerializer.Serialize(batchMsg);
-            var exactBatchData = new byte[batchLength];
-            Array.Copy(batchBuffer, exactBatchData, batchLength);
+            var exactBatchData = NatifySerializer.SerializeSimple(batchMsg);
 
             // Dùng NatsConnection thuần để bắn thẳng gói tin rác này vào Server 3 lần liên tiếp!
             var rawNats = new NATS.Client.Core.NatsConnection(new NATS.Client.Core.NatsOpts { Url = NatsUrl });
@@ -1274,9 +1270,7 @@ namespace Natify.Tests
             var batchMsg = new NatifyBatch();
             var payload = new StringValue { Value = "Sword_Level_99" };
 
-            var (buffer, length) = NatifySerializer.Serialize(payload);
-            var exactData = new byte[length];
-            Array.Copy(buffer, exactData, length);
+            var exactData = NatifySerializer.SerializeSimple(payload);
 
             batchMsg.Payloads.Add(Google.Protobuf.ByteString.CopyFrom(exactData));
             batchMsg.ReqId.Add(fixedMessageId);
@@ -1284,9 +1278,7 @@ namespace Natify.Tests
             batchMsg.RepId.Add(string.Empty);
             batchMsg.FromInstanceId = "VN-01";
 
-            var (batchBuffer, batchLength) = NatifySerializer.Serialize(batchMsg);
-            var exactBatchData = new byte[batchLength];
-            Array.Copy(batchBuffer, exactBatchData, batchLength);
+            var exactBatchData = NatifySerializer.SerializeSimple(batchMsg);
 
             // Dùng kết nối NATS thô để đóng giả Server gửi tin cậy
             var rawNats = new NATS.Client.Core.NatsConnection(new NATS.Client.Core.NatsOpts { Url = NatsUrl });

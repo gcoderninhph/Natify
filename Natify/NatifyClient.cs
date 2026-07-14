@@ -164,18 +164,15 @@ namespace Natify
 
                         string batchId = Guid.NewGuid().ToString("N");
 
-                        var (buffer, length) = NatifySerializer.Serialize(batchMsg);
-                        var exactData = new byte[length];
-                        Array.Copy(buffer, exactData, length);
-                        System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
+                        var rented = NatifySerializer.SerializePooled(batchMsg);
 
-                        Trigger.AddSent(length, batchMsg.Payloads.Count);
+                        Trigger.AddSent(rented.Length, batchMsg.Payloads.Count);
                         Trigger.AddBatchSent();
 
                         var unackedMsg = new UnackedMessage
                         {
                             Subject = subject,
-                            Payload = exactData,
+                            Buffer = rented,
                             BatchId = batchId,
                             LastSent = DateTime.UtcNow,
                             RetryCount = 0
@@ -184,7 +181,7 @@ namespace Natify
                         _unackedMessages.TryAdd(batchId, unackedMsg);
 
                         var headers = new NatsHeaders { ["Natify-BatchId"] = batchId };
-                        await _connection.PublishAsync(subject, exactData, headers: headers,
+                        await _connection.PublishAsync(subject, rented.Data, headers: headers,
                             cancellationToken: _cts.Token);
                     }
                 }
@@ -201,7 +198,10 @@ namespace Natify
                     var parts = msg.Subject.Split('.');
                     string messageId = parts[^1];
 
-                    _unackedMessages.TryRemove(messageId, out _);
+                    if (_unackedMessages.TryRemove(messageId, out var unacked))
+                    {
+                        unacked.Buffer?.Dispose();
+                    }
                 }
             });
 
@@ -219,7 +219,10 @@ namespace Natify
                             {
                                 LogError(
                                     $"[NatifyClient] Drop gói tin {unacked.BatchId} vì vượt quá số lần Retry.");
-                                _unackedMessages.TryRemove(kvp.Key, out _);
+                                if (_unackedMessages.TryRemove(kvp.Key, out var removed))
+                                {
+                                    removed.Buffer?.Dispose();
+                                }
                                 continue;
                             }
 
@@ -227,7 +230,7 @@ namespace Natify
                             unacked.RetryCount++;
 
                             var headers = new NatsHeaders { ["Natify-BatchId"] = unacked.BatchId };
-                            await _connection.PublishAsync(unacked.Subject!, unacked.Payload!, headers: headers,
+                            await _connection.PublishAsync(unacked.Subject!, unacked.Buffer!.Data, headers: headers,
                                 cancellationToken: _cts.Token);
                         }
                     }
@@ -248,10 +251,7 @@ namespace Natify
 
             string subject = NatifyTopics.GetClientPublishSubject(_serverNameToConnect, _clientName, _regionId, topic);
 
-            var (buffer, length) = NatifySerializer.Serialize(message);
-            var exactData = new byte[length];
-            Array.Copy(buffer, exactData, length);
-            System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
+            var exactData = NatifySerializer.SerializeSimple(message);
 
             reqId = Guid.NewGuid().ToString("N");
 
@@ -280,16 +280,7 @@ namespace Natify
 
                         if (!string.IsNullOrEmpty(messageId))
                         {
-                            string ackSubject =
-                                $"NatifyServer.{_serverNameToConnect}.{_clientName}.{_regionId}.ACK.{messageId}";
-                            _ = _connection.PublishAsync(ackSubject, Array.Empty<byte>()).AsTask();
-
-                            if (_processedMessages.TryAdd(messageId, 1))
-                            {
-                                Trigger.AddDedupItem();
-                                _messageTtlWheel.AddOrUpdate(messageId, 1, TimeSpan.FromSeconds(10));
-                            }
-                            else
+                            if (!_processedMessages.TryAdd(messageId, 1))
                             {
                                 continue;
                             }
@@ -305,7 +296,20 @@ namespace Natify
                         {
                             Trigger.AddError();
                             LogError($"[NatifyClient] Error Parsing Batch: {ex.Message}");
+                            if (!string.IsNullOrEmpty(messageId))
+                            {
+                                _processedMessages.TryRemove(messageId, out _);
+                            }
                             continue;
+                        }
+
+                        if (!string.IsNullOrEmpty(messageId))
+                        {
+                            Trigger.AddDedupItem();
+                            _messageTtlWheel.AddOrUpdate(messageId, 1, TimeSpan.FromSeconds(10));
+                            string ackSubject =
+                                $"NatifyServer.{_serverNameToConnect}.{_clientName}.{_regionId}.ACK.{messageId}";
+                            _ = _connection.PublishAsync(ackSubject, Array.Empty<byte>()).AsTask();
                         }
 
                         Action processBatch = () =>
@@ -471,6 +475,14 @@ namespace Natify
             while ((!_unackedMessages.IsEmpty) && (DateTime.UtcNow - waitStartTime).TotalSeconds < 2)
             {
                 await Task.Delay(50);
+            }
+
+            foreach (var kvp in _unackedMessages)
+            {
+                if (_unackedMessages.TryRemove(kvp.Key, out var unacked))
+                {
+                    unacked.Buffer?.Dispose();
+                }
             }
 
             try
