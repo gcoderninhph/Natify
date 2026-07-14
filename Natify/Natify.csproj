@@ -5,7 +5,12 @@
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
         <LangVersion>latest</LangVersion>
-        <Version>1.1.0</Version>
+        <Version>1.2.0</Version>
+        <PackageId>Natify</PackageId>
+        <Authors>Natify</Authors>
+        <Description>Micro-batching library for NATS messaging with deduplication, TTL-based dedup wheel, reliable ACK/Retry, and zero-copy serialization.</Description>
+        <PackageTags>nats;batching;messaging;pubsub</PackageTags>
+        <PackageLicenseExpression>MIT</PackageLicenseExpression>
     </PropertyGroup>
 
     <ItemGroup>
