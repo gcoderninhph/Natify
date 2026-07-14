@@ -12,7 +12,7 @@ using NATS.Client.Core;
 
 namespace Natify
 {
-    public class NatifyServer : IDisposable
+    internal class NatifyServer : INatifyServer
     {
         private readonly string _instanceId;
 
@@ -46,7 +46,7 @@ namespace Natify
         private Task? _retryWorkerTask;
         private Task? _ackListenerTask;
 
-        public NatifyServer(string url, string serverName, string groupName, string clientNameToConnect,
+        private NatifyServer(string url, string serverName, string groupName, string clientNameToConnect,
             Config? config = null)
         {
             if (config != null)
@@ -64,12 +64,18 @@ namespace Natify
 
             var opts = new NatsOpts { Url = url };
             _connection = new NatsConnection(opts);
-
-            _connection.ConnectAsync().AsTask().GetAwaiter().GetResult();
             _cts = new CancellationTokenSource();
-            StartServerReliablePublishFeatures();
-            _batchWorkerTask = Task.Run(BatchWorkerAsync);
-            OnMessageRep();
+        }
+
+        public static async Task<INatifyServer> CreateAsync(string url, string serverName, string groupName,
+            string clientNameToConnect, Config? config = null)
+        {
+            var server = new NatifyServer(url, serverName, groupName, clientNameToConnect, config);
+            await server._connection.ConnectAsync();
+            server.StartServerReliablePublishFeatures();
+            server._batchWorkerTask = Task.Run(server.BatchWorkerAsync);
+            server.OnMessageRep();
+            return server;
         }
 
         private void OnMessagesExpired(IReadOnlyList<(string Key, byte Value)> expiredItems)
@@ -83,7 +89,7 @@ namespace Natify
             Trigger.RemoveDedupItems(expiredItems.Count);
         }
 
-        private void StartServerReliablePublishFeatures()
+        internal void StartServerReliablePublishFeatures()
         {
             // 1. Luồng lắng nghe ACK từ Client gửi lên
             // Client sẽ gửi vào: NatifyServer.{serverName}.{clientName}.{regionId}.ACK.{messageId}
@@ -450,7 +456,7 @@ namespace Natify
             });
         }
 
-        public void Dispose()
+        public async ValueTask DisposeAsync()
         {
             if (_isDisposed) return;
             _isDisposed = true;
@@ -461,7 +467,7 @@ namespace Natify
             {
                 try
                 {
-                    _batchWorkerTask.Wait(TimeSpan.FromSeconds(2));
+                    await Task.WhenAny(_batchWorkerTask, Task.Delay(TimeSpan.FromSeconds(2)));
                 }
                 catch
                 {
@@ -477,7 +483,7 @@ namespace Natify
             while ((!_unackedMessages.IsEmpty) && (DateTime.UtcNow - waitStartTime).TotalSeconds < 2)
             {
                 // Tạm nghỉ một chút để luồng ACK Listener kịp làm việc
-                Thread.Sleep(50);
+                await Task.Delay(50);
             }
 
             // BƯỚC 2: Sập cầu dao (Cancel Token)
@@ -493,7 +499,8 @@ namespace Natify
             // BƯỚC 3: Đợi các Task chạy ngầm kết thúc hoàn toàn
             try
             {
-                Task.WaitAll(new[] { _retryWorkerTask, _ackListenerTask }, TimeSpan.FromSeconds(1));
+                await Task.WhenAny(Task.WhenAll(_retryWorkerTask!, _ackListenerTask!),
+                    Task.Delay(TimeSpan.FromSeconds(1)));
             }
             catch
             {
@@ -504,7 +511,7 @@ namespace Natify
 
             try
             {
-                _connection.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                await _connection.DisposeAsync();
             }
             catch
             {

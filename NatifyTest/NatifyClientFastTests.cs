@@ -17,8 +17,8 @@ namespace NatifyTest
     {
         private const string NatsUrl = "nats://127.0.0.1:4222";
 
-        private NatifyServer CreateServer(string name = "TestServer", string expectedClient = "TestClientFast") =>
-            new NatifyServer(NatsUrl, name, "QG1", expectedClient);
+        private async Task<INatifyServer> CreateServer(string name = "TestServer", string expectedClient = "TestClientFast") =>
+            await INatifyServer.CreateAsync(NatsUrl, name, "QG1", expectedClient);
 
         private Task<INatifyClient> CreateClientFast(string name = "TestClientFast", string group = "Group1",
             string expectedServer = "TestServer") =>
@@ -28,7 +28,7 @@ namespace NatifyTest
         [Test]
         public async Task Test01_BasicPublish_ServerReceives()
         {
-            using var server = CreateServer();
+            await using var server = await CreateServer();
             var client = await CreateClientFast();
             var tcs = new TaskCompletionSource<string>();
 
@@ -44,7 +44,7 @@ namespace NatifyTest
         [Test]
         public async Task Test02_ServerPublish_ClientReceives()
         {
-            using var server = CreateServer();
+            await using var server = await CreateServer();
             var client = await CreateClientFast();
             var tcs = new TaskCompletionSource<string>();
 
@@ -59,7 +59,7 @@ namespace NatifyTest
         [Test]
         public async Task Test03_BasicRequest_ServerReplies()
         {
-            using var server = CreateServer();
+            await using var server = await CreateServer();
             var client = await CreateClientFast();
 
             server.OnRequest<StringValue, StringValue>("ReqTopic1",
@@ -75,7 +75,7 @@ namespace NatifyTest
         [Test]
         public async Task Test04_ServerRequest_ClientReplies()
         {
-            using var server = CreateServer();
+            await using var server = await CreateServer();
             var client = await CreateClientFast();
 
             client.OnRequest<StringValue, StringValue>("ReqTopic2",
@@ -91,7 +91,7 @@ namespace NatifyTest
         [Test]
         public async Task Test05_ClientAsyncCallback_Works()
         {
-            using var server = CreateServer();
+            await using var server = await CreateServer();
             var client = await CreateClientFast();
             var tcs = new TaskCompletionSource<string>();
 
@@ -123,7 +123,7 @@ namespace NatifyTest
         [Test]
         public async Task Test07_Publish_LargePayload()
         {
-            using var server = CreateServer();
+            await using var server = await CreateServer();
             var client = await CreateClientFast();
             var largeString = new string('A', 50000); // 50KB payload
             var tcs = new TaskCompletionSource<string>();
@@ -140,7 +140,7 @@ namespace NatifyTest
         [Test]
         public async Task Test08_MultiplePUBs_AreGrouped()
         {
-            using var server = CreateServer();
+            await using var server = await CreateServer();
             var client = await CreateClientFast();
             int limit = 100;
             var countdown = new CountdownEvent(limit);
@@ -152,7 +152,7 @@ namespace NatifyTest
                 client.Publish("MultiPub", new StringValue { Value = i.ToString() });
             }
 
-            Assert.That(countdown.Wait(TimeSpan.FromSeconds(5)), Is.True);
+            Assert.That(await Task.Run(() => countdown.Wait(TimeSpan.FromSeconds(5))), Is.True);
             await client.DisposeAsync();
         }
 
@@ -160,8 +160,8 @@ namespace NatifyTest
         [Test]
         public async Task Test09_MultipleClients_SameGroup_LoadBalancing()
         {
-            using var server1 = CreateServer("TestServer");
-            using var server2 = CreateServer("TestServer");
+            await using var server1 = await CreateServer("TestServer");
+            await using var server2 = await CreateServer("TestServer");
             var client = await CreateClientFast();
 
             // Note: Server currently has hardcoded QG1 for queue group, so they load balance
@@ -172,7 +172,7 @@ namespace NatifyTest
             server2.OnMessage<StringValue>("LB", _ => Interlocked.Increment(ref count2));
 
             for (int i = 0; i < 100; i++) client.Publish("LB", new StringValue { Value = "1" });
-            Thread.Sleep(1000); // Wait delivery
+            await Task.Delay(1000); // Wait delivery
 
             Assert.That(count1 + count2, Is.EqualTo(100));
             // Usually load balances, but at least shouldn't be 200 (duplicate)
@@ -183,7 +183,7 @@ namespace NatifyTest
         [Test]
         public async Task Test1M_Performance_10K_PUB()
         {
-            using var server = CreateServer();
+            await using var server = await CreateServer();
             var client = await CreateClientFast();
             int limit = 1_000_000;
             var countdown = new CountdownEvent(limit);
@@ -193,7 +193,7 @@ namespace NatifyTest
             var sw = Stopwatch.StartNew();
             for (int i = 0; i < limit; i++) client.Publish("PerfPUB", new Empty());
 
-            Assert.That(countdown.Wait(TimeSpan.FromSeconds(10)), Is.True);
+            Assert.That(await Task.Run(() => countdown.Wait(TimeSpan.FromSeconds(10))), Is.True);
             sw.Stop();
             Console.WriteLine($"1m PUB took {sw.ElapsedMilliseconds}ms");
             await client.DisposeAsync();
@@ -203,7 +203,7 @@ namespace NatifyTest
         [Test]
         public async Task Test11_Performance_1K_REQREP()
         {
-            using var server = CreateServer();
+            await using var server = await CreateServer();
             var client = await CreateClientFast();
             int limit = 1_000_000;
 
@@ -226,7 +226,7 @@ namespace NatifyTest
         [Test]
         public async Task Test12_ConcurrentPublish()
         {
-            using var server = CreateServer();
+            await using var server = await CreateServer();
             var client = await CreateClientFast();
             var localClient = client;
             int threads = 10;
@@ -240,7 +240,7 @@ namespace NatifyTest
                 for (int j = 0; j < msgsPerThread; j++) localClient.Publish("ConcPub", new Empty());
             });
 
-            Assert.That(countdown.Wait(TimeSpan.FromSeconds(10)), Is.True);
+            Assert.That(await Task.Run(() => countdown.Wait(TimeSpan.FromSeconds(10))), Is.True);
             await client.DisposeAsync();
         }
 
@@ -290,7 +290,7 @@ namespace NatifyTest
             // Wait a sec so it retries a few times
             await Task.Delay(500);
 
-            using var server = CreateServer();
+            await using var server = await CreateServer();
             var tcs = new TaskCompletionSource<bool>();
             server.OnMessage<Empty>("RetryTopic", _ => tcs.TrySetResult(true));
 
@@ -302,7 +302,7 @@ namespace NatifyTest
         [Test]
         public async Task Test15_ConcurrentLargeRequests()
         {
-            using var server = CreateServer();
+            await using var server = await CreateServer();
             var client = await CreateClientFast();
             var localClient = client;
             var largePayload = new string('B', 10000); // 10KB
@@ -328,7 +328,7 @@ namespace NatifyTest
         [Test]
         public async Task Test16_ServerConcurrentPublishToClient()
         {
-            using var server = CreateServer();
+            await using var server = await CreateServer();
             var client = await CreateClientFast();
             var localServer = server;
             var countdown = new CountdownEvent(1000);
@@ -337,7 +337,7 @@ namespace NatifyTest
 
             Parallel.For(0, 1000, _ => { localServer.Publish("SrvPub", "Region1", new Empty()); });
 
-            Assert.That(countdown.Wait(TimeSpan.FromSeconds(5)), Is.True);
+            Assert.That(await Task.Run(() => countdown.Wait(TimeSpan.FromSeconds(5))), Is.True);
             await client.DisposeAsync();
         }
 
@@ -345,7 +345,7 @@ namespace NatifyTest
         [Test]
         public async Task Test17_EmptyMessagePublish()
         {
-            using var server = CreateServer();
+            await using var server = await CreateServer();
             var client = await CreateClientFast();
             var tcs = new TaskCompletionSource<bool>();
 
@@ -360,7 +360,7 @@ namespace NatifyTest
         [Test]
         public async Task Test18_ServerThrows_ClientRetriesOrTimesOut()
         {
-            using var server = CreateServer();
+            await using var server = await CreateServer();
             var client = await CreateClientFast();
 
             server.OnRequest("ErrReq",
@@ -376,7 +376,7 @@ namespace NatifyTest
         [Test]
         public async Task Test19_MultipleClients_DifferentGroup_Sub()
         {
-            using var server = CreateServer("TestServer", "ClientMultiple");
+            await using var server = await CreateServer("TestServer", "ClientMultiple");
             var c1 = await CreateClientFast("ClientMultiple", "Grp1");
             var c2 = await CreateClientFast("ClientMultiple", "Grp2");
 
@@ -385,11 +385,11 @@ namespace NatifyTest
             c2.OnMessage<Empty>("BrCast", _ => Interlocked.Increment(ref rcv2));
 
             // Wait subscription settling
-            Thread.Sleep(200);
+            await Task.Delay(200);
 
             server.Publish("BrCast", "Region1", new Empty());
 
-            Thread.Sleep(500);
+            await Task.Delay(500);
             Assert.That(rcv1, Is.EqualTo(1));
             Assert.That(rcv2, Is.EqualTo(1));
 
@@ -416,7 +416,7 @@ namespace NatifyTest
         [Test]
         public async Task Test21_Performance_200K_REQREP_Correctness()
         {
-            using var server = CreateServer();
+            await using var server = await CreateServer();
             var client = await CreateClientFast();
             int limit = 200000;
 
