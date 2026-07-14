@@ -11,7 +11,7 @@ using NATS.Client.Core;
 
 namespace Natify
 {
-    public class NatifyClientFast : INatifyClient
+    internal class NatifyClientFast : INatifyClient
     {
         private readonly ConcurrentDictionary<string, UnackedMessage> _unackedMessages = new();
         private readonly TimeSpan _ackTimeout = TimeSpan.FromMilliseconds(100);
@@ -37,7 +37,7 @@ namespace Natify
         public NatifyClientTriggers Trigger { get; } = new();
 
         private int _maxCount = 1000;
-        private int _maxSize = 50 * 1024; // 50 KB
+        private int _maxSize = 50 * 1024;
         private TimeSpan _maxWait = TimeSpan.FromMilliseconds(50);
 
         private readonly Channel<(string Subject, byte[] Payload, string MessageType, string ReqId, string RepId)>
@@ -440,6 +440,10 @@ namespace Natify
             });
         }
 
+        public void Tick()
+        {
+        }
+
         private void LogError(string message)
         {
             Console.WriteLine(message);
@@ -458,12 +462,11 @@ namespace Natify
                 {
                     if (await Task.WhenAny(_batchWorkerTask, Task.Delay(TimeSpan.FromSeconds(2))) == _batchWorkerTask)
                     {
-                        await _batchWorkerTask; // Ném exception nếu task bị lỗi
+                        await _batchWorkerTask;
                     }
                 }
                 catch
                 {
-                    //
                 }
             }
 
@@ -479,7 +482,6 @@ namespace Natify
             }
             catch
             {
-                //
             }
 
             try
@@ -501,7 +503,6 @@ namespace Natify
             }
             catch
             {
-                //
             }
 
             Trigger.Dispose();
@@ -512,7 +513,6 @@ namespace Natify
             }
             catch
             {
-                //
             }
 
             _messageTtlWheel.OnExpired -= OnMessagesExpired;

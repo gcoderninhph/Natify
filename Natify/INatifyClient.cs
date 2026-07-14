@@ -8,12 +8,27 @@ namespace Natify
 {
     public interface INatifyClient : IAsyncDisposable
     {
+        NatifyClientTriggers Trigger { get; }
+
         public static Task<INatifyClient> CreateFast(string url, string clientName, string groupName,
             string regionId,
             string serverNameToConnect, Config? config = null)
         {
             return NatifyClientFast.Create(url, clientName, groupName, regionId, serverNameToConnect, config);
         }
+
+        public static Task<INatifyClient> Create(string url, string clientName, string groupName,
+            string regionId,
+            string serverNameToConnect, Config? config = null)
+        {
+            return NatifyClient.Create(url, clientName, groupName, regionId, serverNameToConnect, config);
+        }
+
+        /// <summary>
+        /// Dequeues and invokes pending callbacks on the main thread (Unity).
+        /// Has no effect for the Fast variant.
+        /// </summary>
+        void Tick();
 
         void Publish<T>(string topic, T message) where T : IMessage;
         void OnMessage<T>(string topic, Action<Data<T>> callback) where T : IMessage, new();

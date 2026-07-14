@@ -1,6 +1,7 @@
 ﻿using System.Collections.Concurrent;
 using Google.Protobuf.WellKnownTypes;
 using Natify.Test.GRPC; // Dùng các Protobuf có sẵn của Google
+using System.Threading;
 
 namespace Natify.Tests
 {
@@ -10,26 +11,26 @@ namespace Natify.Tests
     {
         private const string NatsUrl = "nats://localhost:4222";
         private NatifyServer _server;
-        private NatifyClient _clientA;
-        private NatifyClient _clientB;
+        private INatifyClient _clientA;
+        private INatifyClient _clientB;
 
         [SetUp]
-        public void Setup()
+        public async Task Setup()
         {
             _server = new NatifyServer(NatsUrl, "GameServer", "ServerGroup", "GameClient");
 
             // Client A ở Region VN-01
-            _clientA = new NatifyClient(NatsUrl, "GameClient", "ClientGroupA", "VN-01", "GameServer");
+            _clientA = await INatifyClient.Create(NatsUrl, "GameClient", "ClientGroupA", "VN-01", "GameServer");
 
             // Client B ở Region US-West (Dành cho test đa kết nối)
-            _clientB = new NatifyClient(NatsUrl, "GameClient", "ClientGroupB", "US-West", "GameServer");
+            _clientB = await INatifyClient.Create(NatsUrl, "GameClient", "ClientGroupB", "US-West", "GameServer");
         }
 
         [TearDown]
-        public void TearDown()
+        public async Task TearDown()
         {
-            _clientA?.Dispose();
-            _clientB?.Dispose();
+            if (_clientA != null) await _clientA.DisposeAsync();
+            if (_clientB != null) await _clientB.DisposeAsync();
             _server?.Dispose();
         }
 
@@ -55,7 +56,7 @@ namespace Natify.Tests
             _clientA.Publish("PlayerJoin", payload);
 
             // Wait max 2 seconds for network
-            bool success = waitHandle.Wait(TimeSpan.FromSeconds(2));
+            bool success = await Task.Run(() => waitHandle.Wait(TimeSpan.FromSeconds(2)));
 
             // Assert
             Assert.That(success, Is.True, "Server không nhận được tin nhắn");
@@ -178,7 +179,7 @@ namespace Natify.Tests
             }
 
             // Chờ 5 giây 
-            bool allReceived = waitHandle.Wait(TimeSpan.FromSeconds(5));
+            bool allReceived = await Task.Run(() => waitHandle.Wait(TimeSpan.FromSeconds(5)));
 
             // Lọc ra các viên bị thiếu để log
             var missingBullets = new System.Collections.Generic.List<int>();
@@ -211,7 +212,7 @@ namespace Natify.Tests
             _clientA.Publish("GlobalChat", new StringValue { Value = "Xin chào" });
             _clientB.Publish("GlobalChat", new StringValue { Value = "Hello" });
 
-            bool success = waitHandle.Wait(TimeSpan.FromSeconds(2));
+            bool success = await Task.Run(() => waitHandle.Wait(TimeSpan.FromSeconds(2)));
 
             // Assert
             Assert.That(success, Is.True, "Server không nhận đủ tin nhắn từ các Client");
@@ -239,7 +240,7 @@ namespace Natify.Tests
             var payload = new StringValue { Value = hugeData };
             _clientA.Publish("SyncMapData", payload);
 
-            bool success = waitHandle.Wait(TimeSpan.FromSeconds(5));
+            bool success = await Task.Run(() => waitHandle.Wait(TimeSpan.FromSeconds(5)));
 
             // Assert
             Assert.That(success, Is.True, "Timeout khi nhận gói tin lớn.");
@@ -287,7 +288,7 @@ namespace Natify.Tests
 
             await Task.WhenAll(t1, t2, t3);
 
-            bool success = waitHandle.Wait(TimeSpan.FromSeconds(5));
+            bool success = await Task.Run(() => waitHandle.Wait(TimeSpan.FromSeconds(5)));
 
             // Assert
             Assert.That(success, Is.True,
@@ -298,14 +299,13 @@ namespace Natify.Tests
         }
 
         [Test]
-        public void Test8_GracefulShutdown_ShouldNotCrashWhenDisposed()
+        public async Task Test8_GracefulShutdown_ShouldNotCrashWhenDisposed()
         {
             // Cố tình đẩy 1 tin nhắn vào
             _clientA.Publish("SomeTopic", new StringValue { Value = "Last Words" });
 
             // Rút phích cắm NGAY LẬP TỨC
-            Assert.DoesNotThrow(() => { _clientA.Dispose(); },
-                "Dispose bị crash do xử lý luồng (Channel/Thread) không an toàn!");
+            await _clientA.DisposeAsync();
 
             // Thử Publish tiếp sau khi đã Dispose xem có bị Crash App không
             Assert.DoesNotThrow(() => { _clientA.Publish("SomeTopic", new StringValue { Value = "Ghost Message" }); },
@@ -377,7 +377,7 @@ namespace Natify.Tests
             // Đợi tất cả các luồng bắn xong
             await Task.WhenAll(tasks);
 
-            bool success = waitHandle.Wait(TimeSpan.FromSeconds(5));
+            bool success = await Task.Run(() => waitHandle.Wait(TimeSpan.FromSeconds(5)));
 
             // Assert
             Assert.That(success, Is.True, $"Bắn đồng thời bị rớt đạn! Nhận được: {receivedCounter}/{totalExpected}");
@@ -486,7 +486,7 @@ namespace Natify.Tests
             }
 
             // Thời gian chờ chỉ cho phép tối đa 1 giây. Nếu Batch bị kẹt vì đợi đủ 50, test sẽ Fail.
-            bool success = waitHandle.Wait(TimeSpan.FromSeconds(1));
+            bool success = await Task.Run(() => waitHandle.Wait(TimeSpan.FromSeconds(1)));
 
             // Assert
             Assert.That(success, Is.True, "Gom Batch bị kẹt! Không xả dữ liệu khi timeout 10ms.");
@@ -727,7 +727,7 @@ namespace Natify.Tests
 
             _clientA.Publish("WorldChat", new StringValue { Value = complexText });
 
-            waitHandle.Wait(TimeSpan.FromSeconds(2));
+            await Task.Run(() => waitHandle.Wait(TimeSpan.FromSeconds(2)));
 
             Assert.That(receivedText, Is.EqualTo(complexText), "Lỗi Encoding! Dữ liệu bị biến dạng khi gửi qua mạng.");
         }
@@ -829,7 +829,7 @@ namespace Natify.Tests
             });
 
             // Chờ tối đa 10 giây
-            bool success = waitHandle.Wait(TimeSpan.FromSeconds(10));
+            bool success = await Task.Run(() => waitHandle.Wait(TimeSpan.FromSeconds(10)));
             stopwatch.Stop();
 
             var missingMessages = sentTracker.Keys.Except(receivedTracker.Keys).ToList();
@@ -938,7 +938,7 @@ namespace Natify.Tests
                 }
             });
 
-            waitHandle.Wait(TimeSpan.FromSeconds(10));
+            await Task.Run(() => waitHandle.Wait(TimeSpan.FromSeconds(10)));
 
             // Ghi nhận số lần dọn rác sau khi test
             int finalGen0Collections = GC.CollectionCount(0);
@@ -980,7 +980,7 @@ namespace Natify.Tests
                 _clientA.Publish("TriggerTest", new Int32Value { Value = i });
             }
 
-            bool success = waitHandle.Wait(TimeSpan.FromSeconds(5));
+            bool success = await Task.Run(() => waitHandle.Wait(TimeSpan.FromSeconds(5)));
 
             // Assert
             Assert.That(success, Is.True, "Server không nhận đủ tin nhắn.");
@@ -1051,7 +1051,7 @@ namespace Natify.Tests
             await rawNats.PublishAsync(subject, exactBatchData, headers: headers);
 
             // Chờ 2 giây
-            bool signaled = waitHandle.Wait(TimeSpan.FromSeconds(2));
+            bool signaled = await Task.Run(() => waitHandle.Wait(TimeSpan.FromSeconds(2)));
 
             // Assert
             Assert.That(signaled, Is.True, "Server không nhận được gói tin.");
@@ -1104,7 +1104,7 @@ namespace Natify.Tests
             }
 
             // 4. Chờ Client xử lý xong
-            bool success = waitHandle.Wait(TimeSpan.FromSeconds(5));
+            bool success = await Task.Run(() => waitHandle.Wait(TimeSpan.FromSeconds(5)));
             ctsUnityLoop.Cancel();
 
             // 5. Assert
@@ -1133,7 +1133,7 @@ namespace Natify.Tests
             _clientA.Publish("GC_Test", new StringValue { Value = "Need_To_Be_Cleaned" });
 
             // Đợi Server nhận được
-            waitHandle.Wait(TimeSpan.FromSeconds(2));
+            await Task.Run(() => waitHandle.Wait(TimeSpan.FromSeconds(2)));
 
             // Ngay sau khi nhận, CacheSize phải tăng lên ít nhất 1
             Assert.That(_server.Trigger.CurrentDedupCacheSize, Is.GreaterThan(initialCacheSize),
@@ -1203,8 +1203,8 @@ namespace Natify.Tests
             _server.Publish("SystemAnnouncement", "VN-01", new StringValue { Value = "BaoTri_VN" });
             _server.Publish("SystemAnnouncement", "US-West", new StringValue { Value = "Maintenance_US" });
 
-            bool successA = waitHandleA.Wait(TimeSpan.FromSeconds(2));
-            bool successB = waitHandleB.Wait(TimeSpan.FromSeconds(2));
+            bool successA = await Task.Run(() => waitHandleA.Wait(TimeSpan.FromSeconds(2)));
+            bool successB = await Task.Run(() => waitHandleB.Wait(TimeSpan.FromSeconds(2)));
 
             cts.Cancel();
             // Assert
@@ -1413,7 +1413,7 @@ namespace Natify.Tests
             });
 
             // Chờ tối đa 15 giây
-            bool success = waitHandle.Wait(TimeSpan.FromSeconds(15));
+            bool success = await Task.Run(() => waitHandle.Wait(TimeSpan.FromSeconds(15)));
             stopwatch.Stop();
             cts.Cancel();
 
@@ -1476,7 +1476,7 @@ namespace Natify.Tests
 
             // CHÚ Ý: Vì Tick() bị kìm hãm ở 6000 msg/s, nên bắt buộc phải đợi ít nhất ~17 giây. 
             // Ta set Timeout là 30 giây để an toàn.
-            bool success = waitHandle.Wait(TimeSpan.FromSeconds(30));
+            bool success = await Task.Run(() => waitHandle.Wait(TimeSpan.FromSeconds(30)));
             stopwatch.Stop();
             cts.Cancel();
 
@@ -1529,7 +1529,7 @@ namespace Natify.Tests
                 }
             });
 
-            waitHandle.Wait(TimeSpan.FromSeconds(20));
+            await Task.Run(() => waitHandle.Wait(TimeSpan.FromSeconds(20)));
             cts.Cancel();
 
             int finalGen0 = GC.CollectionCount(0);
@@ -1871,7 +1871,7 @@ namespace Natify.Tests
             });
 
             // Chờ tối đa 10 giây
-            bool success = waitHandle.Wait(TimeSpan.FromSeconds(10));
+            bool success = await Task.Run(() => waitHandle.Wait(TimeSpan.FromSeconds(10)));
             stopwatch.Stop();
 
 
@@ -1978,7 +1978,7 @@ namespace Natify.Tests
             });
 
             // Chờ tối đa 10 giây
-            bool success = waitHandle.Wait(TimeSpan.FromSeconds(50));
+            bool success = await Task.Run(() => waitHandle.Wait(TimeSpan.FromSeconds(50)));
             stopwatch.Stop();
             
             await cts.CancelAsync(); // Dừng vòng lặp Tick
