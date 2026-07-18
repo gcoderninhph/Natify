@@ -1,555 +1,580 @@
-﻿using System;
-using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.Threading;
-using System.Threading.Channels;
+﻿using System.Collections.Concurrent;
 using Gcoder.Collections;
-using System.Threading.Tasks;
 using Google.Protobuf;
 using NATS.Client.Core;
 
-namespace Natify
+namespace Natify;
+
+internal class NatifyClient : INatifyClient
 {
-    internal class NatifyClient : INatifyClient
+    private readonly Dictionary<string, UnackedMessage> _unackedMessages = new();
+    private readonly TimeSpan _ackTimeout = TimeSpan.FromMilliseconds(100);
+    private readonly INatsConnection _connection;
+    private readonly string _clientName;
+    private readonly string _groupName;
+    private readonly string _regionId;
+    private readonly string _serverNameToConnect;
+    private readonly string _instanceId;
+    private bool _isDisposed;
+    private readonly int _maxRetries = 10;
+
+
+    private List<Task> _publishList = [];
+    private List<Task> _publishListSnapshot = [];
+    private Task _publishFlushTask = Task.CompletedTask;
+
+    private readonly HashSet<string> _processedMessages;
+    private readonly ITimedCollection<string, Action> _messageTtlWheel;
+    private readonly TimeSpan _processedMessageExpTime = TimeSpan.FromSeconds(10);
+
+    private readonly Dictionary<string, ReplyTask> _replyTasks = new();
+
+    public NatifyClientTriggers Trigger { get; } = new();
+
+    private int _maxCount = 1000;
+    private int _maxSize = 50 * 1024;
+    private TimeSpan _maxWait = TimeSpan.FromMilliseconds(50);
+
+    private readonly Queue<BatchMessage> _messagePublishQueue = new();
+    private readonly Dictionary<string, BatchAccumulator> _batchToSend = new();
+
+    private CancellationTokenSource _cts;
+    private CancellationTokenSource _subscribeCts;
+    private readonly ConcurrentQueue<Action> _mainThreadActions = new();
+
+    public static async Task<INatifyClient> Create(string url, string clientName, string groupName,
+        string regionId,
+        string serverNameToConnect, Config? config = null)
     {
-        private readonly ConcurrentDictionary<string, UnackedMessage> _unackedMessages = new();
-        private readonly TimeSpan _ackTimeout = TimeSpan.FromMilliseconds(100);
-        private readonly INatsConnection _connection;
-        private readonly string _clientName;
-        private readonly string _groupName;
-        private readonly string _regionId;
-        private readonly string _serverNameToConnect;
-        private readonly string _instanceId;
-        private bool _isDisposed = false;
-        private readonly int _maxRetries = 10;
-        private Task? _batchWorkerTask;
-        private Task? _retryWorkerTask;
-        private Task? _ackListenerTask;
+        var nc = new NatifyClient(url, clientName, groupName, regionId, serverNameToConnect, config);
+        await nc._connection.ConnectAsync();
+        nc.StartReliableFeatures();
+        nc.OnMessageRep();
+        return nc;
+    }
 
-        private readonly ConcurrentDictionary<string, byte> _processedMessages;
-        private readonly ITimedCollection<string, byte> _messageTtlWheel;
-
-        private readonly ConcurrentDictionary<string, (TaskCompletionSource<ByteString> task, CancellationTokenSource ct)>
-            _replyTasks = new();
-
-        public NatifyClientTriggers Trigger { get; } = new();
-
-        private int _maxCount = 1000;
-        private int _maxSize = 50 * 1024;
-        private TimeSpan _maxWait = TimeSpan.FromMilliseconds(50);
-
-        private readonly Channel<(string Subject, RentedBuffer Payload, string MessageType, string ReqId, string RepId)>
-            _batchChannel =
-                Channel.CreateUnbounded<(string, RentedBuffer, string, string, string)>();
-
-        private CancellationTokenSource _cts;
-        private readonly ConcurrentQueue<Action> _mainThreadActions = new();
-
-        public static async Task<INatifyClient> Create(string url, string clientName, string groupName,
-            string regionId,
-            string serverNameToConnect, Config? config = null)
+    private NatifyClient(string url, string clientName, string groupName, string regionId,
+        string serverNameToConnect, Config? config = null)
+    {
+        if (config != null)
         {
-            var nc = new NatifyClient(url, clientName, groupName, regionId, serverNameToConnect, config);
-            await nc._connection.ConnectAsync();
-            nc.StartReliableFeatures();
-            nc.StartBatchWorker();
-            nc.OnMessageRep();
-            return nc;
+            _maxCount = config.MaxCount;
+            _maxSize = config.MaxSize;
+            _maxWait = config.MaxWait;
         }
 
-        private NatifyClient(string url, string clientName, string groupName, string regionId,
-            string serverNameToConnect, Config? config = null)
+        _clientName = clientName;
+        _groupName = groupName;
+        _regionId = regionId;
+        _serverNameToConnect = serverNameToConnect;
+        _instanceId = Guid.NewGuid().ToString("N");
+
+        _processedMessages = [];
+
+        _messageTtlWheel = ITimedCollection<string, Action>.NewTimeSortSet();
+        _messageTtlWheel.OnExpired += OnMessagesExpired;
+
+        var opts = new NatsOpts
         {
-            if (config != null)
-            {
-                _maxCount = config.MaxCount;
-                _maxSize = config.MaxSize;
-                _maxWait = config.MaxWait;
-            }
+            Url = url
+        };
+        _connection = new NatsConnection(opts);
+        _cts = new CancellationTokenSource();
+        _subscribeCts = new CancellationTokenSource();
+    }
 
-            _clientName = clientName;
-            _groupName = groupName;
-            _regionId = regionId;
-            _serverNameToConnect = serverNameToConnect;
-            _instanceId = Guid.NewGuid().ToString("N");
+    private void OnMessagesExpired(IReadOnlyList<(string Key, Action Value)> expiredItems)
+    {
+        foreach (var item in expiredItems) item.Value();
+        Trigger.RemoveDedupItems(expiredItems.Count);
+    }
 
-            _processedMessages = new ConcurrentDictionary<string, byte>();
-            _messageTtlWheel = ITimedCollection<string, byte>.NewTimeSortSet();
-            _messageTtlWheel.OnExpired += OnMessagesExpired;
-
-            var opts = new NatsOpts
-            {
-                Url = url
-            };
-            _connection = new NatsConnection(opts);
-            _cts = new CancellationTokenSource();
-        }
-
-        private void OnMessagesExpired(IReadOnlyList<(string Key, byte Value)> expiredItems)
+    // Lắng nghe atk từ server
+    private void StartReliableFeatures()
+    {
+        string ackSubject = $"NatifyClient.{_clientName}.{_serverNameToConnect}.{_regionId}.ACK.*";
+        _ = Task.Run(async () =>
         {
-            foreach (var item in expiredItems)
+            try
             {
-                _processedMessages.TryRemove(item.Key, out _);
-            }
-
-            Trigger.RemoveDedupItems(expiredItems.Count);
-        }
-
-        private void StartBatchWorker()
-        {
-            _batchWorkerTask = Task.Run(BatchWorkerAsync);
-        }
-
-        private async Task BatchWorkerAsync()
-        {
-            var reader = _batchChannel.Reader;
-
-            while (await reader.WaitToReadAsync(_cts.Token))
-            {
-                var batches = new Dictionary<string, BatchAccumulator>();
-                int currentCount = 0;
-                int currentSizeBytes = 0;
-
-                var batchStartTime = DateTime.UtcNow;
-
-                while (currentCount < _maxCount && currentSizeBytes < _maxSize)
-                {
-                    var elapsed = DateTime.UtcNow - batchStartTime;
-                    if (elapsed >= _maxWait)
-                    {
-                        break;
-                    }
-
-                    if (reader.TryRead(out var item))
-                    {
-                        if (!batches.TryGetValue(item.Subject, out var acc))
-                        {
-                            acc = new BatchAccumulator();
-                            batches[item.Subject] = acc;
-                        }
-
-                        acc.Add(item.Payload, item.ReqId, item.MessageType, item.RepId);
-
-                        currentCount++;
-                        currentSizeBytes += item.Payload.Length;
-                    }
-                    else
-                    {
-                        var timeLeft = _maxWait - elapsed;
-
-                        try
-                        {
-                            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
-                            timeoutCts.CancelAfter(timeLeft);
-
-                            await reader.WaitToReadAsync(timeoutCts.Token);
-                        }
-                        catch (OperationCanceledException)
-                        {
-                            break;
-                        }
-                    }
-                }
-
-                if (currentCount > 0)
-                {
-                    foreach (var kvp in batches)
-                    {
-                        string subject = kvp.Key;
-                        BatchAccumulator acc = kvp.Value;
-
-                        string batchId = Guid.NewGuid().ToString("N");
-
-                        try
-                        {
-                            var rented = NatifySerializer.SerializeBatchPooled(
-                                acc.Payloads, acc.ReqIds, acc.MsgTypes, acc.RepIds, _instanceId);
-
-                            Trigger.AddSent(rented.Length, acc.Count);
-                            Trigger.AddBatchSent();
-
-                            var unackedMsg = new UnackedMessage
-                            {
-                                Subject = subject,
-                                Buffer = rented,
-                                BatchId = batchId,
-                                LastSent = DateTime.UtcNow,
-                                RetryCount = 0
-                            };
-
-                            _unackedMessages.TryAdd(batchId, unackedMsg);
-
-                            var headers = new NatsHeaders { ["Natify-BatchId"] = batchId };
-                            await _connection.PublishAsync(subject, rented.Data, headers: headers,
-                                cancellationToken: _cts.Token);
-                        }
-                        finally
-                        {
-                            acc.Dispose();
-                        }
-                    }
-                }
-            }
-        }
-
-        private void StartReliableFeatures()
-        {
-            string ackSubject = $"NatifyClient.{_clientName}.{_serverNameToConnect}.{_regionId}.ACK.*";
-            _ackListenerTask = Task.Run(async () =>
-            {
-                await foreach (var msg in _connection.SubscribeAsync<byte[]>(ackSubject, cancellationToken: _cts.Token))
+                await foreach (var msg in _connection.SubscribeAsync<byte[]>(ackSubject,
+                                   cancellationToken: _cts.Token))
                 {
                     var parts = msg.Subject.Split('.');
                     string messageId = parts[^1];
-
-                    if (_unackedMessages.TryRemove(messageId, out var unacked))
+                    _mainThreadActions.Enqueue(() =>
                     {
-                        unacked.Buffer?.Dispose();
-                    }
-                }
-            });
-
-            _retryWorkerTask = Task.Run(async () =>
-            {
-                while (!_cts.IsCancellationRequested)
-                {
-                    var now = DateTime.UtcNow;
-                    foreach (var kvp in _unackedMessages)
-                    {
-                        var unacked = kvp.Value;
-                        if (now - unacked.LastSent > _ackTimeout)
+                        if (_unackedMessages.TryGetValue(messageId, out var unacked))
                         {
-                            if (unacked.RetryCount >= _maxRetries)
-                            {
-                                LogError(
-                                    $"[NatifyClient] Drop gói tin {unacked.BatchId} vì vượt quá số lần Retry.");
-                                if (_unackedMessages.TryRemove(kvp.Key, out var removed))
-                                {
-                                    removed.Buffer?.Dispose();
-                                }
-                                continue;
-                            }
-
-                            unacked.LastSent = DateTime.UtcNow;
-                            unacked.RetryCount++;
-
-                            var headers = new NatsHeaders { ["Natify-BatchId"] = unacked.BatchId };
-                            await _connection.PublishAsync(unacked.Subject!, unacked.Buffer!.Data, headers: headers,
-                                cancellationToken: _cts.Token);
+                            unacked.Buffer?.Dispose();
+                            _unackedMessages.Remove(messageId);
                         }
-                    }
-
-                    await Task.Delay(100, _cts.Token);
+                    });
                 }
-            });
-        }
-
-        public void Publish<T>(string topic, T message) where T : IMessage =>
-            Publish(topic, message, "PUB", out _, string.Empty);
-
-        private void Publish<T>(string topic, T message, string messageType, out string reqId, string repId)
-            where T : IMessage
-        {
-            reqId = string.Empty;
-            if (_isDisposed) return;
-
-            string subject = NatifyTopics.GetClientPublishSubject(_serverNameToConnect, _clientName, _regionId, topic);
-
-            var exactData = NatifySerializer.SerializePooled(message);
-
-            reqId = Guid.NewGuid().ToString("N");
-
-            _batchChannel.Writer.TryWrite((subject, exactData, messageType, reqId, repId));
-        }
-
-        private void OnMessage(string topic, Action<Data<ByteString>>? callback, Func<Data<ByteString>, Task>? callbackAsync,
-            bool requiresMainThread = true)
-        {
-            var subject = NatifyTopics.GetClientListenSubject(_clientName, _serverNameToConnect, _regionId, topic);
-
-            _ = Task.Run(async () =>
+            }
+            catch (OperationCanceledException)
             {
+                // shutdown bình thường
+            }
+        });
+    }
+
+    private DateTime _batchWorkerLastTick = DateTime.UtcNow;
+
+    private void BatchWorkerTick(bool force = false)
+    {
+        var now = DateTime.UtcNow;
+        if (now - _batchWorkerLastTick < _maxWait && !force) return;
+        _batchWorkerLastTick = now;
+
+        _batchToSend.Clear();
+        int currentCount = 0;
+        int currentSizeBytes = 0;
+
+        var batchStartTime = DateTime.UtcNow;
+
+        while (currentCount < _maxCount && currentSizeBytes < _maxSize &&
+               _messagePublishQueue.TryDequeue(out var item))
+        {
+            var elapsed = DateTime.UtcNow - batchStartTime;
+            if (elapsed >= _maxWait)
+            {
+                break;
+            }
+
+            if (!_batchToSend.TryGetValue(item.Subject, out var accExits))
+            {
+                accExits = new BatchAccumulator();
+                _batchToSend[item.Subject] = accExits;
+            }
+
+            accExits.Add(item.Payload, item.ReqId, item.MessageType, item.RepId);
+
+            currentCount++;
+            currentSizeBytes += item.Payload.Length;
+        }
+
+        if (currentCount > 0)
+        {
+            foreach (var kvp in _batchToSend)
+            {
+                string subject = kvp.Key;
+                BatchAccumulator acc = kvp.Value;
+
+                string batchId = Guid.NewGuid().ToString("N");
+
                 try
                 {
-                    await foreach (var msg in _connection.SubscribeAsync<byte[]>(subject, queueGroup: _groupName,
-                                       cancellationToken: _cts.Token))
+                    var rented = NatifySerializer.SerializeBatchPooled(
+                        acc.Payloads, acc.ReqIds, acc.MsgTypes, acc.RepIds, _instanceId);
+
+                    Trigger.AddSent(rented.Length, acc.Count);
+                    Trigger.AddBatchSent();
+
+                    var unackedMsg = new UnackedMessage
                     {
-                        string messageId = string.Empty;
-                        if (msg.Headers != null && msg.Headers.TryGetValue("Natify-BatchId", out var msgIdVal))
-                        {
-                            messageId = msgIdVal.ToString();
-                        }
+                        Subject = subject,
+                        Buffer = rented,
+                        BatchId = batchId,
+                        LastSent = DateTime.UtcNow,
+                        RetryCount = 0
+                    };
 
-                        var payload = msg.Data ?? Array.Empty<byte>();
+                    _unackedMessages.TryAdd(batchId, unackedMsg);
 
+                    var headers = new NatsHeaders { ["Natify-BatchId"] = batchId };
+                    _publishList.Add(_connection.PublishAsync(subject, rented.Data, headers: headers,
+                        cancellationToken: _cts.Token).AsTask());
+                }
+                finally
+                {
+                    acc.Dispose();
+                }
+            }
+        }
+    }
+
+    private DateTime _retryWorkerLastTime = DateTime.UtcNow;
+    private TimeSpan _retryWorkerTime = TimeSpan.FromMilliseconds(100);
+
+    private void RetryWorkerTick(bool force = false)
+    {
+        var now = DateTime.UtcNow;
+        if (now - _retryWorkerLastTime < _retryWorkerTime && !force) return;
+        _retryWorkerLastTime = now;
+
+        foreach (var kvp in _unackedMessages)
+        {
+            var unacked = kvp.Value;
+            if (now - unacked.LastSent > _ackTimeout)
+            {
+                if (unacked.RetryCount >= _maxRetries)
+                {
+                    LogError(
+                        $"[NatifyClient] Drop gói tin {unacked.BatchId} vì vượt quá số lần Retry.");
+                    if (_unackedMessages.TryGetValue(kvp.Key, out var removed))
+                    {
+                        removed.Buffer?.Dispose();
+                        _unackedMessages.Remove(kvp.Key);
+                    }
+
+                    continue;
+                }
+
+                unacked.LastSent = DateTime.UtcNow;
+                unacked.RetryCount++;
+
+                var headers = new NatsHeaders { ["Natify-BatchId"] = unacked.BatchId };
+                _publishList.Add(_connection.PublishAsync(unacked.Subject!, unacked.Buffer!.Data, headers: headers,
+                    cancellationToken: _cts.Token).AsTask());
+            }
+        }
+    }
+
+    public void Publish<T>(string topic, T message) where T : IMessage =>
+        Publish(topic, message, "PUB", out _, string.Empty);
+
+    private void Publish<T>(string topic, T message, string messageType, out string reqId, string repId)
+        where T : IMessage
+    {
+        reqId = string.Empty;
+        if (_isDisposed) return;
+
+        string subject = NatifyTopics.GetClientPublishSubject(_serverNameToConnect, _clientName, _regionId, topic);
+
+        var exactData = NatifySerializer.SerializePooled(message);
+
+        reqId = Guid.NewGuid().ToString("N");
+
+        _messagePublishQueue.Enqueue(new BatchMessage(subject, exactData, messageType, reqId, repId));
+    }
+
+    private void OnMessage(string topic, Action<Data<ByteString>>? callback,
+        Func<Data<ByteString>, Task>? callbackAsync)
+    {
+        var subject = NatifyTopics.GetClientListenSubject(_clientName, _serverNameToConnect, _regionId, topic);
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await foreach (var msg in _connection.SubscribeAsync<byte[]>(subject, queueGroup: _groupName,
+                                   cancellationToken: _subscribeCts.Token))
+                {
+                    string messageId = string.Empty;
+                    if (msg.Headers != null && msg.Headers.TryGetValue("Natify-BatchId", out var msgIdVal))
+                    {
+                        messageId = msgIdVal.ToString();
+                    }
+
+                    var payload = msg.Data ?? [];
+
+                    _mainThreadActions.Enqueue(() =>
+                    {
                         if (!string.IsNullOrEmpty(messageId))
                         {
-                            if (!_processedMessages.TryAdd(messageId, 1))
+                            if (!_processedMessages.Add(messageId))
                             {
-                                continue;
+                                return;
                             }
                         }
 
-                        NatifyBatch batch;
+                        if (!CreateBatch(payload, messageId, out var batch)) return;
+                        AtkMessage(messageId);
+
                         try
                         {
-                            batch = NatifySerializer.Deserialize<NatifyBatch>(payload, payload.Length);
-                            Trigger.AddReceived(payload.Length, batch.Payloads.Count);
+                            for (var i = 0; i < batch.Payloads.Count; i++)
+                            {
+                                var payload2 = batch.Payloads[i];
+                                var instanceId = batch.FromInstanceId;
+                                var reqId = batch.ReqId[i];
+                                var repId = batch.RepId[i];
+                                var result = new Data<ByteString>(payload2, instanceId, reqId, repId);
+                                callback?.Invoke(result);
+                                _ = callbackAsync?.Invoke(result);
+                            }
                         }
                         catch (Exception ex)
                         {
                             Trigger.AddError();
-                            LogError($"[NatifyClient] Error Parsing Batch: {ex.Message}");
-                            if (!string.IsNullOrEmpty(messageId))
-                            {
-                                _processedMessages.TryRemove(messageId, out _);
-                            }
-                            continue;
+                            LogError($"[NatifyClient] OnMessage Error on {topic}: {ex.Message}");
                         }
-
-                        if (!string.IsNullOrEmpty(messageId))
-                        {
-                            Trigger.AddDedupItem();
-                            _messageTtlWheel.AddOrUpdate(messageId, 1, TimeSpan.FromSeconds(10));
-                            string ackSubject =
-                                $"NatifyServer.{_serverNameToConnect}.{_clientName}.{_regionId}.ACK.{messageId}";
-                            _ = _connection.PublishAsync(ackSubject, Array.Empty<byte>()).AsTask();
-                        }
-
-                        Action processBatch = () =>
-                        {
-                            try
-                            {
-                                for (var i = 0; i < batch.Payloads.Count; i++)
-                                {
-                                    var payload = batch.Payloads[i];
-                                    var instanceId = batch.FromInstanceId;
-                                    var reqId = batch.ReqId[i];
-                                    var repId = batch.RepId[i];
-                                    var result = new Data<ByteString>(payload, instanceId, reqId, repId);
-                                    callback?.Invoke(result);
-                                    if (callbackAsync != null) _ = callbackAsync(result);
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                Trigger.AddError();
-                                LogError($"[NatifyClient] OnMessage Error on {topic}: {ex.Message}");
-                            }
-                        };
-
-                        if (requiresMainThread)
-                        {
-                            _mainThreadActions.Enqueue(processBatch);
-                        }
-                        else
-                        {
-                            processBatch();
-                        }
-                    }
+                    });
                 }
-                catch (OperationCanceledException)
-                {
-                }
-            });
-        }
-
-        private void OnMessageRep()
-        {
-            OnMessage($"Rep-{_instanceId}", data =>
+            }
+            catch (OperationCanceledException)
             {
-                if (_replyTasks.TryRemove(data.RepId, out var task))
-                {
-                    task.task.SetResult(data.Value);
-                    task.ct.Dispose();
-                }
-            }, null, false);
+            }
+        });
+    }
+
+    private void AtkMessage(string messageId)
+    {
+        if (!string.IsNullOrEmpty(messageId))
+        {
+            Trigger.AddDedupItem();
+            _messageTtlWheel.AddOrUpdate(messageId, () => _processedMessages.Remove(messageId),
+                _processedMessageExpTime);
+            string ackSubject = $"NatifyServer.{_serverNameToConnect}.{_clientName}.{_regionId}.ACK.{messageId}";
+            _publishList.Add(_connection.PublishAsync(ackSubject, Array.Empty<byte>()).AsTask());
+        }
+    }
+
+    private async Task WaitAllAckAsync()
+    {
+        await _publishFlushTask;
+
+        if (_publishList.Count == 0)
+            return;
+
+        (_publishList, _publishListSnapshot) = (_publishListSnapshot, _publishList);
+        try
+        {
+            _publishFlushTask = Task.WhenAll(_publishListSnapshot);
+            await _publishFlushTask;
+        }
+        finally
+        {
+            _publishListSnapshot.Clear();
+        }
+    }
+
+    private bool CreateBatch(byte[] payload, string messageId, out NatifyBatch batch)
+    {
+        try
+        {
+            batch = NatifySerializer.Deserialize<NatifyBatch>(payload, payload.Length);
+            Trigger.AddReceived(payload.Length, batch.Payloads.Count);
+        }
+        catch (Exception ex)
+        {
+            Trigger.AddError();
+            LogError($"[NatifyClient] Error Parsing Batch: {ex.Message}");
+            if (!string.IsNullOrEmpty(messageId))
+            {
+                _processedMessages.Remove(messageId);
+            }
+
+            batch = null!;
+            return false;
         }
 
-        public void OnMessage<T>(string topic, Action<Data<T>> callback) where T : IMessage, new()
+        return true;
+    }
+
+    private void OnMessageRep()
+    {
+        OnMessage($"Rep-{_instanceId}", data =>
         {
-            OnMessage(topic, data =>
+            if (_replyTasks.TryGetValue(data.RepId, out var task))
+            {
+                task.Task.SetResult(data.Value);
+                task.Ct.Dispose();
+                _replyTasks.Remove(data.RepId);
+            }
+        }, null);
+    }
+
+    public void OnMessage<T>(string topic, Action<Data<T>> callback) where T : IMessage, new()
+    {
+        OnMessage(topic, data =>
+        {
+            try
             {
                 var result = NatifySerializer.Deserialize<T>(data.Value);
                 callback(new Data<T>(result, data.InstanceId, data.ReqId, data.RepId));
-            }, null, true);
-        }
+            }
+            catch
+            {
+                Trigger.AddError();
+            }
+        }, null);
+    }
 
-        public void OnMessage<T>(string topic, Func<Data<T>, Task> callback) where T : IMessage, new()
+    public void OnMessage<T>(string topic, Func<Data<T>, Task> callback) where T : IMessage, new()
+    {
+        OnMessage(topic, null, async data =>
         {
-            OnMessage(topic, null, async data =>
+            try
             {
                 var result = NatifySerializer.Deserialize<T>(data.Value);
                 await callback(new Data<T>(result, data.InstanceId, data.ReqId, data.RepId));
-            }, true);
-        }
-
-        public async Task<TRes> RequestAsync<TReq, TRes>(string topic, TReq requestData, TimeSpan timeout)
-            where TReq : IMessage
-            where TRes : IMessage, new()
-        {
-            if (_isDisposed) throw new ObjectDisposedException(nameof(NatifyClient));
-
-            Publish(topic, requestData, "REQ", out var reqId, string.Empty);
-            if (!string.IsNullOrEmpty(reqId))
-            {
-                var cancellationTokenSource = new CancellationTokenSource();
-                var taskCompletionSource = new TaskCompletionSource<ByteString>();
-
-                cancellationTokenSource.Token.Register(() =>
-                {
-                    if (_replyTasks.TryRemove(reqId, out var removed))
-                    {
-                        removed.task.TrySetException(new TimeoutException(
-                            $"[NatifyClient] Request {reqId} timed out after {timeout.TotalMilliseconds}ms."));
-                        removed.ct.Dispose();
-                    }
-                });
-
-                cancellationTokenSource.CancelAfter(timeout);
-                _replyTasks[reqId] = (taskCompletionSource, cancellationTokenSource);
-
-                var result = await taskCompletionSource.Task;
-                var t = NatifySerializer.Deserialize<TRes>(result);
-                return t;
             }
-
-            throw new Exception($"[NatifyClient] Request Failed: {reqId}");
-        }
-
-        public void OnRequest<TReq, TRep>(string topic, Func<TReq, TRep> handler)
-            where TReq : IMessage, new()
-            where TRep : IMessage
-        {
-            OnMessage<TReq>(topic, tReq =>
+            catch
             {
-                var result = handler(tReq.Value);
-                Publish($"Rep-{tReq.InstanceId}", result, "REP", out var reqId, tReq.ReqId);
-            });
-        }
+                Trigger.AddError();
+            }
+        });
+    }
 
-        public void OnRequest<TReq, TRep>(string topic, Func<TReq, Task<TRep>> handlerAsync)
-            where TReq : IMessage, new()
-            where TRep : IMessage
+    public async Task<TRes> RequestAsync<TReq, TRes>(string topic, TReq requestData, TimeSpan timeout)
+        where TReq : IMessage
+        where TRes : IMessage, new()
+    {
+        if (_isDisposed) throw new ObjectDisposedException(nameof(NatifyClient));
+
+        Publish(topic, requestData, "REQ", out var reqId, string.Empty);
+        if (!string.IsNullOrEmpty(reqId))
         {
-            OnMessage<TReq>(topic, async tReq =>
+            var cancellationTokenSource = new CancellationTokenSource();
+            var taskCompletionSource = new TaskCompletionSource<ByteString>();
+
+            cancellationTokenSource.Token.Register(() =>
             {
-                var result = await handlerAsync(tReq.Value);
-                Publish($"Rep-{tReq.InstanceId}", result, "REP", out var reqId, tReq.ReqId);
+                if (_replyTasks.TryGetValue(reqId, out var removed))
+                {
+                    removed.Task.TrySetException(new TimeoutException(
+                        $"[NatifyClient] Request {reqId} timed out after {timeout.TotalMilliseconds}ms."));
+                    removed.Ct.Dispose();
+                    _replyTasks.Remove(reqId);
+                }
             });
+
+            cancellationTokenSource.CancelAfter(timeout);
+            _replyTasks[reqId] = new ReplyTask(taskCompletionSource, cancellationTokenSource);
+
+            var result = await taskCompletionSource.Task;
+            var t = NatifySerializer.Deserialize<TRes>(result);
+            return t;
         }
 
-        public void Tick()
+        throw new Exception($"[NatifyClient] Request Failed: {reqId}");
+    }
+
+    public void OnRequest<TReq, TRep>(string topic, Func<TReq, TRep> handler)
+        where TReq : IMessage, new()
+        where TRep : IMessage
+    {
+        OnMessage<TReq>(topic, tReq =>
         {
-            int count = 0;
-            while (count < 100 && _mainThreadActions.TryDequeue(out var action))
+            var result = handler(tReq.Value);
+            Publish($"Rep-{tReq.InstanceId}", result, "REP", out _, tReq.ReqId);
+        });
+    }
+
+    public void OnRequest<TReq, TRep>(string topic, Func<TReq, Task<TRep>> handlerAsync)
+        where TReq : IMessage, new()
+        where TRep : IMessage
+    {
+        OnMessage<TReq>(topic, async tReq =>
+        {
+            var result = await handlerAsync(tReq.Value);
+            Publish($"Rep-{tReq.InstanceId}", result, "REP", out _, tReq.ReqId);
+        });
+    }
+
+    private void DrainMainThreadActions()
+    {
+        while (_mainThreadActions.TryDequeue(out var action))
+        {
+            try
             {
                 action.Invoke();
-                count++;
+            }
+            catch
+            {
+                Trigger.AddError();
             }
         }
+    }
 
-        private static void LogError(string message)
+    public void Tick()
+    {
+        DrainMainThreadActions();
+        BatchWorkerTick();
+        RetryWorkerTick();
+        _ = WaitAllAckAsync();
+    }
+
+    private static void LogError(string message)
+    {
+        NatifyLogger.Error(message);
+    }
+
+
+    private async Task FlushPublishAsync()
+    {
+        while (true)
         {
-            NatifyLogger.Error(message);
-        }
+            if (_publishList.Count == 0 &&
+                _publishFlushTask.IsCompleted)
+                return;
 
-        public async ValueTask DisposeAsync()
+            await WaitAllAckAsync();
+        }
+    }
+
+    private async Task WaitServerAckAsync(TimeSpan timeout)
+    {
+        var start = DateTime.UtcNow;
+
+        while (_unackedMessages.Count > 0)
         {
-            if (_isDisposed) return;
-            _isDisposed = true;
+            RetryWorkerTick(force: true);
 
-            _batchChannel.Writer.Complete();
-            while (_batchChannel.Reader.TryRead(out var item))
-            {
-                item.Payload.Dispose();
-            }
+            await FlushPublishAsync();
 
-            if (_batchWorkerTask != null)
-            {
-                try
-                {
-                    if (await Task.WhenAny(_batchWorkerTask, Task.Delay(TimeSpan.FromSeconds(2))) == _batchWorkerTask)
-                    {
-                        await _batchWorkerTask;
-                    }
-                }
-                catch
-                {
-                }
-            }
+            DrainMainThreadActions();
 
-            var waitStartTime = DateTime.UtcNow;
-            while ((!_unackedMessages.IsEmpty) && (DateTime.UtcNow - waitStartTime).TotalSeconds < 2)
-            {
-                await Task.Delay(50);
-            }
+            if (DateTime.UtcNow - start > timeout)
+                break;
 
-            foreach (var kvp in _unackedMessages)
-            {
-                if (_unackedMessages.TryRemove(kvp.Key, out var unacked))
-                {
-                    unacked.Buffer?.Dispose();
-                }
-            }
-
-            try
-            {
-                _cts.Cancel();
-            }
-            catch
-            {
-            }
-
-            foreach (var kvp in _replyTasks)
-            {
-                if (_replyTasks.TryRemove(kvp.Key, out var task))
-                {
-                    task.task.TrySetException(new ObjectDisposedException(nameof(NatifyClient)));
-                    task.ct.Dispose();
-                }
-            }
-
-            try
-            {
-                var tasks = new List<Task>();
-
-                if (_retryWorkerTask != null)
-                    tasks.Add(_retryWorkerTask);
-
-                if (_ackListenerTask != null)
-                    tasks.Add(_ackListenerTask);
-
-                var allTasks = Task.WhenAll(tasks);
-
-                if (await Task.WhenAny(allTasks, Task.Delay(TimeSpan.FromSeconds(1))) == allTasks)
-                {
-                    await allTasks;
-                }
-            }
-            catch
-            {
-            }
-
-            Trigger.Dispose();
-
-            while (_mainThreadActions.TryDequeue(out var action))
-            {
-                try { action.Invoke(); } catch (Exception ex) { NatifyLogger.Error($"[NatifyClient] Drain error: {ex.Message}"); }
-            }
-
-            try
-            {
-                await _connection.DisposeAsync();
-            }
-            catch
-            {
-            }
-
-            _messageTtlWheel.OnExpired -= OnMessagesExpired;
-            _messageTtlWheel.Dispose();
-
-            _cts.Dispose();
+            await Task.Delay(20);
         }
+    }
+
+    private void Clean()
+    {
+        foreach (var pair in _unackedMessages)
+        {
+            pair.Value.Buffer?.Dispose();
+        }
+
+        _unackedMessages.Clear();
+
+        while (_messagePublishQueue.TryDequeue(out var batch))
+        {
+            batch.Payload.Dispose();
+        }
+
+        foreach (var reply in _replyTasks.Values)
+        {
+            reply.Task.TrySetException(
+                new ObjectDisposedException(nameof(NatifyClient)));
+
+            reply.Ct.Dispose();
+        }
+
+        _replyTasks.Clear();
+        _messageTtlWheel.OnExpired -= OnMessagesExpired;
+        _messageTtlWheel.Dispose();
+        Trigger.Dispose();
+        _cts.Dispose();
+        _subscribeCts.Dispose();
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_isDisposed) return;
+        _isDisposed = true;
+
+        _subscribeCts.Cancel();
+
+        while (true)
+        {
+            DrainMainThreadActions();
+            BatchWorkerTick(true);
+
+            if (_mainThreadActions.IsEmpty &&
+                _messagePublishQueue.Count == 0)
+                break;
+        }
+
+        await FlushPublishAsync();
+        await WaitServerAckAsync(TimeSpan.FromSeconds(5));
+        _cts.Cancel();
+        await _connection.DisposeAsync();
+        Clean();
     }
 }
