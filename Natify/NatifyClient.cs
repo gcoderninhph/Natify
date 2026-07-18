@@ -27,7 +27,7 @@ internal class NatifyClient : INatifyClient
     private readonly ITimedCollection<string, Action> _messageTtlWheel;
     private readonly TimeSpan _processedMessageExpTime = TimeSpan.FromSeconds(10);
 
-    private readonly Dictionary<string, ReplyTask> _replyTasks = new();
+    private readonly Dictionary<string, Action<ByteString>> _replyAction = new();
 
     public NatifyClientTriggers Trigger { get; } = new();
 
@@ -42,7 +42,7 @@ internal class NatifyClient : INatifyClient
     private CancellationTokenSource _subscribeCts;
     private readonly ConcurrentQueue<Action> _mainThreadActions = new();
 
-    public static async Task<INatifyClient> Create(string url, string clientName, string groupName,
+    internal static async Task<INatifyClient> Create(string url, string clientName, string groupName,
         string regionId,
         string serverNameToConnect, Config? config = null)
     {
@@ -85,7 +85,20 @@ internal class NatifyClient : INatifyClient
 
     private void OnMessagesExpired(IReadOnlyList<(string Key, Action Value)> expiredItems)
     {
-        foreach (var item in expiredItems) item.Value();
+        foreach (var item in expiredItems)
+        {
+            try
+            {
+                item.Value();
+            }
+            catch
+            {
+                Trigger.AddError();
+                NatifyLogger.Error(
+                    "private void OnMessagesExpired(IReadOnlyList<(string Key, Action Value)> expiredItems)");
+            }
+        }
+
         Trigger.RemoveDedupItems(expiredItems.Count);
     }
 
@@ -239,14 +252,12 @@ internal class NatifyClient : INatifyClient
     {
         reqId = string.Empty;
         if (_isDisposed) return;
-
         string subject = NatifyTopics.GetClientPublishSubject(_serverNameToConnect, _clientName, _regionId, topic);
-
         var exactData = NatifySerializer.SerializePooled(message);
-
         reqId = Guid.NewGuid().ToString("N");
-
-        _messagePublishQueue.Enqueue(new BatchMessage(subject, exactData, messageType, reqId, repId));
+        var reqIdAtomic = reqId;
+        _mainThreadActions.Enqueue(() =>
+            _messagePublishQueue.Enqueue(new BatchMessage(subject, exactData, messageType, reqIdAtomic, repId)));
     }
 
     private void OnMessage(string topic, Action<Data<ByteString>>? callback,
@@ -367,11 +378,10 @@ internal class NatifyClient : INatifyClient
     {
         OnMessage($"Rep-{_instanceId}", data =>
         {
-            if (_replyTasks.TryGetValue(data.RepId, out var task))
+            if (_replyAction.TryGetValue(data.RepId, out var task))
             {
-                task.Task.SetResult(data.Value);
-                task.Ct.Dispose();
-                _replyTasks.Remove(data.RepId);
+                task(data.Value);
+                _replyAction.Remove(data.RepId);
             }
         }, null);
     }
@@ -417,22 +427,23 @@ internal class NatifyClient : INatifyClient
         Publish(topic, requestData, "REQ", out var reqId, string.Empty);
         if (!string.IsNullOrEmpty(reqId))
         {
-            var cancellationTokenSource = new CancellationTokenSource();
             var taskCompletionSource = new TaskCompletionSource<ByteString>();
 
-            cancellationTokenSource.Token.Register(() =>
+            _mainThreadActions.Enqueue(() =>
             {
-                if (_replyTasks.TryGetValue(reqId, out var removed))
+                _messageTtlWheel.AddOrUpdate(reqId, () =>
                 {
-                    removed.Task.TrySetException(new TimeoutException(
-                        $"[NatifyClient] Request {reqId} timed out after {timeout.TotalMilliseconds}ms."));
-                    removed.Ct.Dispose();
-                    _replyTasks.Remove(reqId);
-                }
-            });
+                    taskCompletionSource.SetException(new Exception($"[NatifyClient] Timeout: {reqId}"));
+                    _replyAction.Remove(reqId);
+                }, timeout);
 
-            cancellationTokenSource.CancelAfter(timeout);
-            _replyTasks[reqId] = new ReplyTask(taskCompletionSource, cancellationTokenSource);
+                _replyAction[reqId] = byteString =>
+                {
+                    _messageTtlWheel.Remove(reqId);
+                    taskCompletionSource.TrySetResult(byteString);
+                    _replyAction.Remove(reqId);
+                };
+            });
 
             var result = await taskCompletionSource.Task;
             var t = NatifySerializer.Deserialize<TRes>(result);
@@ -484,6 +495,7 @@ internal class NatifyClient : INatifyClient
         DrainMainThreadActions();
         BatchWorkerTick();
         RetryWorkerTick();
+        _messageTtlWheel.Tick();
         _ = WaitAllAckAsync();
     }
 
@@ -538,15 +550,25 @@ internal class NatifyClient : INatifyClient
             batch.Payload.Dispose();
         }
 
-        foreach (var reply in _replyTasks.Values)
+        var actions = _messageTtlWheel.Clear();
+        if (actions.Count > 0)
         {
-            reply.Task.TrySetException(
-                new ObjectDisposedException(nameof(NatifyClient)));
-
-            reply.Ct.Dispose();
+            foreach (var action in actions)
+            {
+                try
+                {
+                    action.Value();
+                }
+                catch
+                {
+                    Trigger.AddError();
+                    NatifyLogger.Error(
+                        "var actions = _messageTtlWheel.Clear();\n        if (actions.Count > 0)\n        {\n            foreach (var action in actions)\n            {\n                try\n                {\n                    action.Value();\n                }\n                catch\n                {....");
+                }
+            }
         }
 
-        _replyTasks.Clear();
+        _replyAction.Clear();
         _messageTtlWheel.OnExpired -= OnMessagesExpired;
         _messageTtlWheel.Dispose();
         Trigger.Dispose();
