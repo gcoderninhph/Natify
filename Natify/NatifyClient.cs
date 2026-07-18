@@ -140,68 +140,71 @@ internal class NatifyClient : INatifyClient
         if (now - _batchWorkerLastTick < _maxWait && !force) return;
         _batchWorkerLastTick = now;
 
-        _batchToSend.Clear();
-        int currentCount = 0;
-        int currentSizeBytes = 0;
-
-        var batchStartTime = DateTime.UtcNow;
-
-        while (currentCount < _maxCount && currentSizeBytes < _maxSize &&
-               _messagePublishQueue.TryDequeue(out var item))
+        while (_messagePublishQueue.Count > 0)
         {
-            var elapsed = DateTime.UtcNow - batchStartTime;
-            if (elapsed >= _maxWait)
+            _batchToSend.Clear();
+            int currentCount = 0;
+            int currentSizeBytes = 0;
+
+            var batchStartTime = DateTime.UtcNow;
+
+            while (currentCount < _maxCount && currentSizeBytes < _maxSize &&
+                   _messagePublishQueue.TryDequeue(out var item))
             {
-                break;
-            }
-
-            if (!_batchToSend.TryGetValue(item.Subject, out var accExits))
-            {
-                accExits = new BatchAccumulator();
-                _batchToSend[item.Subject] = accExits;
-            }
-
-            accExits.Add(item.Payload, item.ReqId, item.MessageType, item.RepId);
-
-            currentCount++;
-            currentSizeBytes += item.Payload.Length;
-        }
-
-        if (currentCount > 0)
-        {
-            foreach (var kvp in _batchToSend)
-            {
-                string subject = kvp.Key;
-                BatchAccumulator acc = kvp.Value;
-
-                string batchId = Guid.NewGuid().ToString("N");
-
-                try
+                var elapsed = DateTime.UtcNow - batchStartTime;
+                if (elapsed >= _maxWait)
                 {
-                    var rented = NatifySerializer.SerializeBatchPooled(
-                        acc.Payloads, acc.ReqIds, acc.MsgTypes, acc.RepIds, _instanceId);
-
-                    Trigger.AddSent(rented.Length, acc.Count);
-                    Trigger.AddBatchSent();
-
-                    var unackedMsg = new UnackedMessage
-                    {
-                        Subject = subject,
-                        Buffer = rented,
-                        BatchId = batchId,
-                        LastSent = DateTime.UtcNow,
-                        RetryCount = 0
-                    };
-
-                    _unackedMessages.TryAdd(batchId, unackedMsg);
-
-                    var headers = new NatsHeaders { ["Natify-BatchId"] = batchId };
-                    _publishList.Add(_connection.PublishAsync(subject, rented.Data, headers: headers,
-                        cancellationToken: _cts.Token).AsTask());
+                    break;
                 }
-                finally
+
+                if (!_batchToSend.TryGetValue(item.Subject, out var accExits))
                 {
-                    acc.Dispose();
+                    accExits = new BatchAccumulator();
+                    _batchToSend[item.Subject] = accExits;
+                }
+
+                accExits.Add(item.Payload, item.ReqId, item.MessageType, item.RepId);
+
+                currentCount++;
+                currentSizeBytes += item.Payload.Length;
+            }
+
+            if (currentCount > 0)
+            {
+                foreach (var kvp in _batchToSend)
+                {
+                    string subject = kvp.Key;
+                    BatchAccumulator acc = kvp.Value;
+
+                    string batchId = Guid.NewGuid().ToString("N");
+
+                    try
+                    {
+                        var rented = NatifySerializer.SerializeBatchPooled(
+                            acc.Payloads, acc.ReqIds, acc.MsgTypes, acc.RepIds, _instanceId);
+
+                        Trigger.AddSent(rented.Length, acc.Count);
+                        Trigger.AddBatchSent();
+
+                        var unackedMsg = new UnackedMessage
+                        {
+                            Subject = subject,
+                            Buffer = rented,
+                            BatchId = batchId,
+                            LastSent = DateTime.UtcNow,
+                            RetryCount = 0
+                        };
+
+                        _unackedMessages.TryAdd(batchId, unackedMsg);
+
+                        var headers = new NatsHeaders { ["Natify-BatchId"] = batchId };
+                        _publishList.Add(_connection.PublishAsync(subject, rented.Data, headers: headers,
+                            cancellationToken: _cts.Token).AsTask());
+                    }
+                    finally
+                    {
+                        acc.Dispose();
+                    }
                 }
             }
         }
@@ -433,7 +436,7 @@ internal class NatifyClient : INatifyClient
             {
                 _messageTtlWheel.AddOrUpdate(reqId, () =>
                 {
-                    taskCompletionSource.SetException(new Exception($"[NatifyClient] Timeout: {reqId}"));
+                    taskCompletionSource.SetException(new TimeoutException($"[NatifyClient] Timeout: {reqId}"));
                     _replyAction.Remove(reqId);
                 }, timeout);
 

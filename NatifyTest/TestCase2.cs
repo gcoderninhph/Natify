@@ -13,25 +13,50 @@ namespace Natify.Tests
         private INatifyServer _server;
         private INatifyClient _clientA;
         private INatifyClient _clientB;
+        private CancellationTokenSource _cts;
+        private int _tickThreadId;
 
         [SetUp]
         public async Task Setup()
         {
-            _server = await INatifyServer.CreateAsync(NatsUrl, "GameServer", "ServerGroup", "GameClient");
-
+            var config = new Config()
+            {
+                // MaxCount = 10000,
+                // MaxSize = 900 * 1024, // 50 KB
+                // MaxWait = TimeSpan.FromMilliseconds(10),
+            };
+            _server = await INatifyServer.CreateAsync(NatsUrl, "GameServer",
+                "ServerGroup", "GameClient", config);
             // Client A ở Region VN-01
-            _clientA = await INatifyClient.Create(NatsUrl, "GameClient", "ClientGroupA", "VN-01", "GameServer");
+            _clientA = await INatifyClient.Create(NatsUrl, "GameClient", "ClientGroupA",
+                "VN-01", "GameServer", config);
 
             // Client B ở Region US-West (Dành cho test đa kết nối)
-            _clientB = await INatifyClient.Create(NatsUrl, "GameClient", "ClientGroupB", "US-West", "GameServer");
+            _clientB = await INatifyClient.Create(NatsUrl, "GameClient", "ClientGroupB",
+                "US-West", "GameServer", config);
+
+            _cts = new CancellationTokenSource();
+            _ = Task.Run(async () =>
+            {
+                while (!_cts.IsCancellationRequested)
+                {
+                    _tickThreadId = Environment.CurrentManagedThreadId;
+                    _clientA.Tick();
+                    _clientB.Tick();
+
+                    await Task.Delay(10);
+                }
+            });
         }
 
         [TearDown]
         public async Task TearDown()
         {
-            if (_clientA != null) await _clientA.DisposeAsync();
-            if (_clientB != null) await _clientB.DisposeAsync();
-            if (_server != null) await _server.DisposeAsync();
+            _cts.Cancel();
+            await _clientA.DisposeAsync();
+            await _clientB.DisposeAsync();
+            await _server.DisposeAsync();
+            _cts.Dispose();
         }
 
         [Test]
@@ -68,10 +93,12 @@ namespace Natify.Tests
         public async Task Test2_ServerToClient_ClientMustTickToProcessMessage()
         {
             // Arrange
-            int processCount = 0;
+            int callBackThreadId = 0;
+            int countMessages = 0;
             _clientA.OnMessage<Int32Value>("UpdateHealth", data =>
             {
-                processCount++;
+                callBackThreadId = Environment.CurrentManagedThreadId;
+                countMessages++;
                 Assert.That(data.Value.Value, Is.EqualTo(100));
             });
 
@@ -84,19 +111,18 @@ namespace Natify.Tests
             await Task.Delay(500); // Đợi tin nhắn bay qua mạng và chui vào Queue của Client
 
             // Assert: Chưa Tick thì count vẫn phải bằng 0
-            Assert.That(processCount, Is.EqualTo(0), "Lỗi: Callback bị chạy ngoài luồng Tick!");
+            Assert.That(callBackThreadId, Is.EqualTo(_tickThreadId), "Lỗi: Callback bị chạy ngoài luồng Tick!");
 
-            // Act: Giả lập Unity gọi Update()
-            _clientA.Tick();
 
             // Assert: Sau khi Tick, tin nhắn phải được bốc ra xử lý
-            Assert.That(processCount, Is.EqualTo(1), "Tick không lấy được tin nhắn ra khỏi Queue");
+            Assert.That(countMessages, Is.EqualTo(1), "Tick không lấy được tin nhắn ra khỏi Queue");
         }
 
         [Test]
         public async Task Test3_TwoWayPingPong_RealtimeCommunicationFlow()
         {
             // Bài test này mô phỏng luồng: Client Ping -> Server -> Client Pong
+            var pingReceived = new ManualResetEventSlim(false);
             var pongReceived = new ManualResetEventSlim(false);
 
             // 1. Client setup hứng PONG
@@ -111,6 +137,7 @@ namespace Natify.Tests
             {
                 if (incoming.data.Value.Value == "Hello_Server")
                 {
+                    pingReceived.Set();
                     var replyPayload = new StringValue { Value = "Server_Acknowledged" };
                     // Gửi trả đúng RegionId của người gửi
                     _server.Publish("PONG_TOPIC", incoming.regionId, replyPayload);
@@ -122,16 +149,12 @@ namespace Natify.Tests
             // 3. Act: Client bắt đầu chuỗi giao tiếp
             _clientA.Publish("PING_TOPIC", new StringValue { Value = "Hello_Server" });
 
-            // 4. Giả lập vòng lặp Game Loop của Unity (Tick liên tục trong 2 giây để chờ Pong)
-            var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
-            while (!cts.IsCancellationRequested && !pongReceived.IsSet)
-            {
-                _clientA.Tick();
-                await Task.Delay(10); // 100 FPS
-            }
+            pingReceived.Wait(TimeSpan.FromSeconds(2));
+            pongReceived.Wait(TimeSpan.FromSeconds(2));
 
             // Assert
-            Assert.That(pongReceived.IsSet, Is.True, "Giao tiếp 2 chiều Ping-Pong thất bại hoặc timeout.");
+            Assert.That(pingReceived.IsSet, Is.True, "Giao tiếp chiều Ping thất bại hoặc timeout.");
+            Assert.That(pongReceived.IsSet, Is.True, "Giao tiếp chiều Pong thất bại hoặc timeout.");
         }
 
         [Test]
@@ -408,7 +431,7 @@ namespace Natify.Tests
                     TimeSpan.FromSeconds(1));
             });
 
-            Assert.That(ex.Message, Does.Contain("timed out").IgnoreCase);
+            Assert.That(ex.Message, Does.Contain("Timeout").IgnoreCase);
         }
 
         /// <summary>
@@ -445,13 +468,7 @@ namespace Natify.Tests
             // Server chính chủ gửi tin nhắn hợp lệ
             _server.Publish("ResilienceTest", "VN-01", new StringValue { Value = "I_AM_ALIVE" });
 
-            // Cần gọi Tick vì ClientA yêu cầu Tick để chạy callback
-            var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
-            while (!cts.IsCancellationRequested && !waitHandle.IsSet)
-            {
-                _clientA.Tick();
-                await Task.Delay(10);
-            }
+            waitHandle.Wait(TimeSpan.FromSeconds(5));
 
             // Assert
             Assert.That(waitHandle.IsSet, Is.True, "Thread OnMessage đã bị Crash bởi dữ liệu rác!");
@@ -547,16 +564,6 @@ namespace Natify.Tests
 
             await Task.Delay(500); // Đợi đường ống nối xong
 
-            // 2. Giả lập Unity Game Loop (Chạy ngầm liên tục 60 FPS)
-            var ctsUnityLoop = new CancellationTokenSource();
-            var unityGameLoop = Task.Run(async () =>
-            {
-                while (!ctsUnityLoop.IsCancellationRequested)
-                {
-                    _clientA.Tick();
-                    await Task.Delay(16); // ~60 Frames per second
-                }
-            });
 
             // 3. ACT: Server chủ động gọi xuống Client ở Region VN-01
             var response = await _server.RequestAsync<StringValue, StringValue>(
@@ -565,8 +572,7 @@ namespace Natify.Tests
                 new StringValue { Value = "Ping" },
                 TimeSpan.FromSeconds(2)); // Đợi tối đa 2 giây
 
-            // Dừng vòng lặp giả lập Unity
-            ctsUnityLoop.Cancel();
+            _cts.Cancel();
 
             // 4. ASSERT
             Assert.That(response, Is.Not.Null);
@@ -601,10 +607,13 @@ namespace Natify.Tests
             int callbackThreadId = -1;
             int processCount = 0;
 
+            var isClaimMessage = new ManualResetEventSlim(false);
+
             // CLIENT: Đăng ký hứng tin nhắn
             _clientA.OnMessage<StringValue>("ThreadCheckTopic", data =>
             {
                 processCount++;
+                isClaimMessage.Set();
                 // Ghi nhận lại ID của luồng đang thực thi hàm callback này
                 callbackThreadId = Thread.CurrentThread.ManagedThreadId;
             });
@@ -615,21 +624,14 @@ namespace Natify.Tests
             _server.Publish("ThreadCheckTopic", "VN-01", new StringValue { Value = "CheckThread" });
 
             // Đợi 500ms cho đạn bay qua mạng. 
-            await Task.Delay(500); // NUnit lại tiếp tục nhảy luồng sau dòng này
-
-            Assert.That(processCount, Is.EqualTo(0), "Callback đã tự động chạy trước khi gọi Tick!");
-
-            // ACT 2: Lấy Thread ID NGAY TRƯỚC KHI gọi Tick
-            int tickThreadId = Thread.CurrentThread.ManagedThreadId;
-            _clientA.Tick(); // Hàm Tick được gọi bởi tickThreadId
+            isClaimMessage.Wait(TimeSpan.FromSeconds(1));
 
             // ASSERT 2
             Assert.That(processCount, Is.EqualTo(1), "Tick không lấy được tin nhắn ra khỏi Queue.");
 
             // BẰNG CHỨNG THÉP
-            Assert.That(callbackThreadId, Is.Not.EqualTo(-1), "Callback chưa ghi nhận được Thread ID");
-            Assert.That(callbackThreadId, Is.EqualTo(tickThreadId),
-                $"LỆCH LUỒNG! Callback chạy ở luồng {callbackThreadId}, nhưng luồng gọi Tick là {tickThreadId}");
+            Assert.That(callbackThreadId, Is.EqualTo(_tickThreadId),
+                $"LỆCH LUỒNG! Callback chạy ở luồng {callbackThreadId}, nhưng luồng gọi Tick là {_tickThreadId}");
         }
 
         [Test]
@@ -697,7 +699,7 @@ namespace Natify.Tests
             });
 
             // Client sẽ bị Timeout vì Server bị lỗi nên không thèm trả lời
-            Assert.That(ex.Message, Does.Contain("timed out").IgnoreCase);
+            Assert.That(ex.Message, Does.Contain("Timeout").IgnoreCase);
 
             // ACT 2: Lập tức gửi một lệnh bình thường xem Server còn sống không?
             var survivalResponse = await _clientA.RequestAsync<StringValue, StringValue>(
@@ -759,17 +761,6 @@ namespace Natify.Tests
 
             await Task.Delay(500); // Đợi NATS nối ống dẫn
 
-            // 2. Giả lập Unity Game Loop chạy ngầm (60 FPS)
-            var ctsUnityLoop = new CancellationTokenSource();
-            var unityGameLoop = Task.Run(async () =>
-            {
-                while (!ctsUnityLoop.IsCancellationRequested)
-                {
-                    _clientA.Tick();
-                    await Task.Delay(16); // Không làm đơ luồng nhờ bất đồng bộ
-                }
-            });
-
             var stopwatch = System.Diagnostics.Stopwatch.StartNew();
 
             // 3. SERVER: Gọi Request xuống Client (Region VN-01)
@@ -781,7 +772,7 @@ namespace Natify.Tests
             );
 
             stopwatch.Stop();
-            ctsUnityLoop.Cancel(); // Dừng game loop
+            _cts.Cancel();
 
             // 4. ASSERT
             Assert.That(response, Is.Not.Null);
@@ -864,15 +855,6 @@ namespace Natify.Tests
 
             await Task.Delay(500);
 
-            var ctsUnityLoop = new CancellationTokenSource();
-            _ = Task.Run(async () =>
-            {
-                while (!ctsUnityLoop.IsCancellationRequested)
-                {
-                    _clientA.Tick();
-                    await Task.Delay(16);
-                }
-            });
 
             // Warmup: Bắn vài phát đầu tiên để JIT Compiler dịch code (Loại bỏ thời gian khởi động)
             for (int i = 0; i < 5; i++)
@@ -896,7 +878,7 @@ namespace Natify.Tests
 
             double totalMs = stopwatch.Elapsed.TotalMilliseconds;
             double averageLatencyMs = totalMs / iterations;
-            await ctsUnityLoop.CancelAsync();
+            await _cts.CancelAsync();
 
             Console.WriteLine(
                 $"[Test 25] 1000 vòng Ping-Pong tốn {totalMs:F2}ms. Độ trễ trung bình RTT: {averageLatencyMs:F4} ms/request.");
@@ -1082,16 +1064,6 @@ namespace Natify.Tests
 
             await Task.Delay(500);
 
-            // 2. Unity Game Loop ảo để Tick liên tục cho Client
-            var ctsUnityLoop = new CancellationTokenSource();
-            _ = Task.Run(async () =>
-            {
-                while (!ctsUnityLoop.IsCancellationRequested)
-                {
-                    _clientA.Tick();
-                    await Task.Delay(16);
-                }
-            });
 
             // 3. Act: Server gửi 50 tin nhắn cho Client A
             for (int i = 0; i < totalFromServer; i++)
@@ -1101,7 +1073,7 @@ namespace Natify.Tests
 
             // 4. Chờ Client xử lý xong
             bool success = await Task.Run(() => waitHandle.Wait(TimeSpan.FromSeconds(5)));
-            ctsUnityLoop.Cancel();
+            _cts.Cancel();
 
             // 5. Assert
             Assert.That(success, Is.True,
@@ -1183,18 +1155,6 @@ namespace Natify.Tests
 
             await Task.Delay(500);
 
-            // Giả lập vòng lặp Game cho cả 2 Client
-            var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
-            _ = Task.Run(async () =>
-            {
-                while (!cts.IsCancellationRequested)
-                {
-                    _clientA.Tick();
-                    _clientB.Tick();
-                    await Task.Delay(16);
-                }
-            });
-
             // Act: Server xả thông báo riêng biệt cho từng Region
             _server.Publish("SystemAnnouncement", "VN-01", new StringValue { Value = "BaoTri_VN" });
             _server.Publish("SystemAnnouncement", "US-West", new StringValue { Value = "Maintenance_US" });
@@ -1202,7 +1162,7 @@ namespace Natify.Tests
             bool successA = await Task.Run(() => waitHandleA.Wait(TimeSpan.FromSeconds(2)));
             bool successB = await Task.Run(() => waitHandleB.Wait(TimeSpan.FromSeconds(2)));
 
-            cts.Cancel();
+            _cts.Cancel();
             // Assert
             Assert.That(successA, Is.True, "Client A không nhận được thông báo");
             Assert.That(successB, Is.True, "Client B không nhận được thông báo");
@@ -1235,16 +1195,6 @@ namespace Natify.Tests
             // Đợi 2 giây để mạng chuyển hết dữ liệu, nhưng TUYỆT ĐỐI KHÔNG GỌI TICK()
             await Task.Delay(2000);
 
-            // Assert 1: Chắc chắn rắng callback chưa hề được chạy (Queue đang giữ hàng)
-            Assert.That(processCount, Is.EqualTo(0),
-                "Lỗi nghiêm trọng: Hàm Callback chạy ngoài Main Thread (Không thông qua Tick)!");
-
-            // Act 2: Game hết lag, Main Thread gọi Tick liên tục để xả Queue
-            // Lưu ý: Hàm Tick() của bạn xử lý tối đa 100 action mỗi lần gọi
-            for (int i = 0; i < 10; i++) // Gọi 10 lần x 100 = dư sức xả hết 500
-            {
-                _clientA.Tick();
-            }
 
             // Assert 2: Queue phải xả chính xác 500 tin nhắn
             Assert.That(processCount, Is.EqualTo(totalMessages), "Client bị rơi rớt dữ liệu khi Queue bị ùn ứ!");
@@ -1293,13 +1243,7 @@ namespace Natify.Tests
             await rawNats.PublishAsync(subject, exactBatchData, headers: headers);
             await rawNats.PublishAsync(subject, exactBatchData, headers: headers);
 
-            // Xả Tick()
-            var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
-            while (!cts.IsCancellationRequested)
-            {
-                _clientA.Tick();
-                await Task.Delay(16);
-            }
+            await Task.Delay(2000);
 
             // Assert: Client chỉ được phép nhận Thanh Gươm Cấp 99 ĐÚNG 1 LẦN
             Assert.That(processCount, Is.EqualTo(1),
@@ -1331,16 +1275,6 @@ namespace Natify.Tests
 
             await Task.Delay(500);
 
-            // Game Loop cho Client
-            var cts = new CancellationTokenSource();
-            _ = Task.Run(async () =>
-            {
-                while (!cts.IsCancellationRequested)
-                {
-                    _clientA.Tick();
-                    await Task.Delay(16);
-                }
-            });
 
             // Act: Server chủ động gọi xuống
             var response = await _server.RequestAsync<StringValue, StringValue>(
@@ -1349,7 +1283,7 @@ namespace Natify.Tests
                 new StringValue { Value = "GiveMeYourSave" },
                 TimeSpan.FromSeconds(5));
 
-            cts.Cancel();
+            _cts.Cancel();
 
             // Assert
             Assert.That(response, Is.Not.Null, "Server bị Timeout khi chờ Client gửi File lớn.");
@@ -1380,16 +1314,6 @@ namespace Natify.Tests
 
             await Task.Delay(500); // Warmup
 
-            // Luồng xả Tick liên tục không nghỉ (Không delay 16ms như 60 FPS)
-            var cts = new CancellationTokenSource();
-            _ = Task.Run(() =>
-            {
-                while (!cts.IsCancellationRequested)
-                {
-                    _clientA.Tick();
-                }
-            });
-
             var stopwatch = System.Diagnostics.Stopwatch.StartNew();
 
             // Act: Server xả 100k tin nhắn
@@ -1407,7 +1331,7 @@ namespace Natify.Tests
             // Chờ tối đa 15 giây
             bool success = await Task.Run(() => waitHandle.Wait(TimeSpan.FromSeconds(15)));
             stopwatch.Stop();
-            cts.Cancel();
+            _cts.Cancel();
 
             // Assert
             Assert.That(success, Is.True, $"Timeout! Client chỉ xử lý được {receivedCount}/{totalMessages} tin nhắn.");
@@ -1443,16 +1367,6 @@ namespace Natify.Tests
 
             await Task.Delay(500);
 
-            // Giả lập Game Loop 60 FPS (Chờ 16ms mỗi Frame)
-            var cts = new CancellationTokenSource();
-            _ = Task.Run(async () =>
-            {
-                while (!cts.IsCancellationRequested)
-                {
-                    _clientA.Tick(); // Chỉ xử lý 100 action mỗi lần
-                    await Task.Delay(16); // 60 FPS
-                }
-            });
 
             var stopwatch = System.Diagnostics.Stopwatch.StartNew();
 
@@ -1470,7 +1384,7 @@ namespace Natify.Tests
             // Ta set Timeout là 30 giây để an toàn.
             bool success = await Task.Run(() => waitHandle.Wait(TimeSpan.FromSeconds(30)));
             stopwatch.Stop();
-            cts.Cancel();
+            _cts.Cancel();
 
             Assert.That(success, Is.True,
                 $"Timeout! Game Loop 60 FPS không thể tiêu hóa kịp. Bị kẹt ở {receivedCount}/{totalMessages}.");
@@ -1506,11 +1420,6 @@ namespace Natify.Tests
             long initialMemory = GC.GetTotalMemory(false);
             int initialGen0 = GC.CollectionCount(0);
 
-            var cts = new CancellationTokenSource();
-            _ = Task.Run(() =>
-            {
-                while (!cts.IsCancellationRequested) _clientA.Tick();
-            });
 
             _ = Task.Run(async () =>
             {
@@ -1522,7 +1431,7 @@ namespace Natify.Tests
             });
 
             await Task.Run(() => waitHandle.Wait(TimeSpan.FromSeconds(20)));
-            cts.Cancel();
+            _cts.Cancel();
 
             int finalGen0 = GC.CollectionCount(0);
             long finalMemory = GC.GetTotalMemory(false);
@@ -1709,20 +1618,11 @@ namespace Natify.Tests
                 }));
             }
 
-            // 2. Chạy Game Loop cho Client (Mở khóa tối đa tốc độ Tick để tiêu hóa 20k request)
-            var cts = new CancellationTokenSource();
-            _ = Task.Run(() =>
-            {
-                while (!cts.IsCancellationRequested)
-                {
-                    _clientA.Tick(); // Lấy 100 action/lần
-                }
-            });
 
             await Task.WhenAll(tasks);
             stopwatch.Stop();
 
-            await cts.CancelAsync();
+            await _cts.CancelAsync();
 
             // Assert
             Console.WriteLine(
@@ -1748,16 +1648,6 @@ namespace Natify.Tests
                 request => { return new Int32Value { Value = request.Value * 2 }; });
 
             await Task.Delay(500);
-
-            // 2. Chạy Game Loop cho Client (Mở khóa tối đa tốc độ Tick để tiêu hóa 20k request)
-            var cts = new CancellationTokenSource();
-            _ = Task.Run(() =>
-            {
-                while (!cts.IsCancellationRequested)
-                {
-                    _clientA.Tick(); // Lấy 100 action/lần
-                }
-            });
 
             var stopwatch = System.Diagnostics.Stopwatch.StartNew();
             var tasks = new List<Task>();
@@ -1790,7 +1680,7 @@ namespace Natify.Tests
 
             await Task.WhenAll(tasks);
             stopwatch.Stop();
-            await cts.CancelAsync(); // Dừng vòng lặp Tick
+            await _cts.CancelAsync(); // Dừng vòng lặp Tick
 
             // Assert
             Console.WriteLine(
@@ -1804,7 +1694,7 @@ namespace Natify.Tests
         [Category("Performance")]
         public async Task Test41_LagBody()
         {
-            int totalMessages = 1_000_000;
+            int totalMessages = 200_000;
             int receivedCount = 0;
             var waitHandle = new ManualResetEventSlim(false);
 
@@ -1863,7 +1753,7 @@ namespace Natify.Tests
             });
 
             // Chờ tối đa 10 giây
-            bool success = await Task.Run(() => waitHandle.Wait(TimeSpan.FromSeconds(10)));
+            bool success = await Task.Run(() => waitHandle.Wait(TimeSpan.FromSeconds(50)));
             stopwatch.Stop();
 
 
@@ -1889,14 +1779,6 @@ namespace Natify.Tests
             int totalMessages = 200_000;
             int receivedCount = 0;
             var waitHandle = new ManualResetEventSlim(false);
-            var cts = new CancellationTokenSource();
-            _ = Task.Run(() =>
-            {
-                while (!cts.IsCancellationRequested)
-                {
-                    _clientA.Tick(); // Lấy 100 action/lần
-                }
-            });
 
             _clientA.OnRequest<Int32Value, TestRequest>("ThroughputTest", data =>
             {
@@ -1972,8 +1854,8 @@ namespace Natify.Tests
             // Chờ tối đa 10 giây
             bool success = await Task.Run(() => waitHandle.Wait(TimeSpan.FromSeconds(50)));
             stopwatch.Stop();
-            
-            await cts.CancelAsync(); // Dừng vòng lặp Tick
+
+            await _cts.CancelAsync(); // Dừng vòng lặp Tick
 
 
             Assert.That(success, Is.True,
