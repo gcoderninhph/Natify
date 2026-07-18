@@ -21,9 +21,9 @@ namespace Natify.Tests
         {
             var config = new Config()
             {
-                // MaxCount = 10000,
-                // MaxSize = 900 * 1024, // 50 KB
-                // MaxWait = TimeSpan.FromMilliseconds(10),
+                // MaxCount = 100,
+                // MaxSize = 10 * 1024, // 50 KB
+                // MaxWait = TimeSpan.FromMilliseconds(2),
             };
             _server = await INatifyServer.CreateAsync(NatsUrl, "GameServer",
                 "ServerGroup", "GameClient", config);
@@ -36,15 +36,14 @@ namespace Natify.Tests
                 "US-West", "GameServer", config);
 
             _cts = new CancellationTokenSource();
-            _ = Task.Run(async () =>
+            _ = Task.Run(() =>
             {
                 while (!_cts.IsCancellationRequested)
                 {
                     _tickThreadId = Environment.CurrentManagedThreadId;
                     _clientA.Tick();
                     _clientB.Tick();
-
-                    await Task.Delay(10);
+                    Thread.Sleep(2);
                 }
             });
         }
@@ -1453,123 +1452,114 @@ namespace Natify.Tests
         /// Sử dụng thuật toán "Tổng cấp số cộng" để xác minh không rớt/không trùng lặp 
         /// mà không cần dùng List/Dictionary (tránh làm sai lệch kết quả đo RAM).
         /// </summary>
-        // [Test]
-        // [Category("Endurance")]
-        // [Timeout(400_000)] // Cho phép Test chạy tối đa ~6.5 phút để tránh bị NUnit ép dừng
-        // public async Task Test38_Endurance_5MinutesSoakTest_NoMemoryLeak_NoMessageLoss()
-        // {
-        //     long receivedCount = 0;
-        //     long receivedSum = 0; // Dùng để checksum toàn vẹn dữ liệu
-        //     long sentCount = 0;
-        //
-        //     _clientA.OnMessage<Int32Value>("SoakTest", data =>
-        //     {
-        //         Interlocked.Increment(ref receivedCount);
-        //         Interlocked.Add(ref receivedSum, data.Value.Value);
-        //     });
-        //
-        //     await Task.Delay(500); // Warmup
-        //
-        //     // Ép dọn rác trước khi bắt đầu để có điểm mốc RAM sạch nhất
-        //     GC.Collect();
-        //     GC.WaitForPendingFinalizers();
-        //     GC.Collect();
-        //     long initialMemoryMB = GC.GetTotalMemory(true) / (1024 * 1024);
-        //
-        //     // 1. Khởi động Game Loop của Client (Cho phép xả max tốc độ)
-        //     var cts = new CancellationTokenSource();
-        //     _ = Task.Run(() =>
-        //     {
-        //         while (!cts.IsCancellationRequested)
-        //         {
-        //             _clientA.Tick();
-        //         }
-        //     });
-        //
-        //     Console.WriteLine($"[Test 38] Bắt đầu Soak Test 5 phút. RAM ban đầu: {initialMemoryMB} MB");
-        //
-        //     var duration = TimeSpan.FromMinutes(5);
-        //     var stopwatch = System.Diagnostics.Stopwatch.StartNew();
-        //     var lastReportTime = stopwatch.Elapsed;
-        //
-        //     // 2. Act: Vòng lặp bắn tin nhắn liên tục trong 5 phút
-        //     _ = Task.Run(async () =>
-        //     {
-        //         while (stopwatch.Elapsed < duration)
-        //         {
-        //             // Bắn từng tin một, Server sẽ tự gom Batch ngầm
-        //             _server.Publish("SoakTest", "VN-01", new Int32Value { Value = (int)sentCount });
-        //             sentCount++;
-        //
-        //             // Nhường luồng mỗi 1000 tin để tránh CPU bị ngộp 100% gây đứt kết nối NATS
-        //             if (sentCount % 1000 == 0)
-        //             {
-        //                 await Task.Yield();
-        //             }
-        //         }
-        //     });
-        //
-        //     // Vòng lặp chính in Log báo cáo mỗi 30 giây để biết Test chưa bị treo
-        //     while (stopwatch.Elapsed < duration)
-        //     {
-        //         if (stopwatch.Elapsed - lastReportTime > TimeSpan.FromSeconds(30))
-        //         {
-        //             long currentMem = GC.GetTotalMemory(false) / (1024 * 1024);
-        //             Console.WriteLine(
-        //                 $"[Soak Test] Đang chạy... Đã gửi: {sentCount:N0} | Đã nhận: {Interlocked.Read(ref receivedCount):N0} | RAM: {currentMem} MB");
-        //             lastReportTime = stopwatch.Elapsed;
-        //         }
-        //
-        //         await Task.Delay(1000);
-        //     }
-        //
-        //     // 3. Kết thúc thời gian bắn: Chờ Client tiêu hóa nốt dữ liệu còn đọng trên mạng
-        //     Console.WriteLine($"[Test 38] Đã hết 5 phút bắn đạn. Chờ Client xử lý nốt hàng tồn...");
-        //
-        //     // Đợi tối đa 30 giây cho luồng nhận bắt kịp luồng gửi
-        //     var catchUpWaitTime = DateTime.UtcNow;
-        //     while (Interlocked.Read(ref receivedCount) < sentCount &&
-        //            (DateTime.UtcNow - catchUpWaitTime).TotalSeconds < 30)
-        //     {
-        //         await Task.Delay(100);
-        //     }
-        //
-        //     stopwatch.Stop();
-        //     cts.Cancel(); // Dừng Game Loop
-        //
-        //     // 4. Đo đạc lại RAM
-        //     GC.Collect();
-        //     GC.WaitForPendingFinalizers();
-        //     GC.Collect();
-        //     long finalMemoryMB = GC.GetTotalMemory(true) / (1024 * 1024);
-        //     long memoryGrowth = finalMemoryMB - initialMemoryMB;
-        //
-        //     // 5. Assert: KIỂM TOÁN DỮ LIỆU
-        //     long finalReceivedCount = Interlocked.Read(ref receivedCount);
-        //     long finalReceivedSum = Interlocked.Read(ref receivedSum);
-        //
-        //     // Công thức tổng cấp số cộng: S = n * (n - 1) / 2 (Vì đếm từ 0)
-        //     long expectedSum = (sentCount - 1) * sentCount / 2;
-        //
-        //     Console.WriteLine("=============================================");
-        //     Console.WriteLine($"[KẾT QUẢ SOAK TEST 5 PHÚT]");
-        //     Console.WriteLine($"- Gửi đi : {sentCount:N0} tin nhắn");
-        //     Console.WriteLine($"- Nhận về: {finalReceivedCount:N0} tin nhắn");
-        //     Console.WriteLine($"- Tăng trưởng RAM: {memoryGrowth} MB");
-        //     Console.WriteLine("=============================================");
-        //
-        //     // Khẳng định 1: Không mất tin nhắn
-        //     Assert.That(finalReceivedCount, Is.EqualTo(sentCount), "CÓ SỰ CỐ MẤT TIN NHẮN (Packet Loss)!");
-        //
-        //     // Khẳng định 2: Dữ liệu chính xác tuyệt đối, không trùng lặp (Dupe), không biến dạng
-        //     Assert.That(finalReceivedSum, Is.EqualTo(expectedSum),
-        //         "DỮ LIỆU BỊ SAI LỆCH! Có thể Deduplication hỏng hoặc Data bị corrupt.");
-        //
-        //     // Khẳng định 3: Không rò rỉ bộ nhớ (Memory Leak)
-        //     // Trong C#, RAM dao động vài chục MB là bình thường do các buffer nội bộ của NATS.
-        //     // Nhưng nếu tăng hơn 100MB nghĩa là có rác không được giải phóng.
-        //     Assert.That(memoryGrowth, Is.LessThan(100), $"NGHI VẤN MEMORY LEAK! RAM tăng quá cao ({memoryGrowth} MB).");
-        // }
+        [Test]
+        [Category("Endurance")]
+        [Timeout(400_000)] // Cho phép Test chạy tối đa ~6.5 phút để tránh bị NUnit ép dừng
+        public async Task Test38_Endurance_5MinutesSoakTest_NoMemoryLeak_NoMessageLoss()
+        {
+            long receivedCount = 0;
+            long receivedSum = 0; // Dùng để checksum toàn vẹn dữ liệu
+            long sentCount = 0;
+        
+            _clientA.OnMessage<Int32Value>("SoakTest", data =>
+            {
+                Interlocked.Increment(ref receivedCount);
+                Interlocked.Add(ref receivedSum, data.Value.Value);
+            });
+        
+            await Task.Delay(500); // Warmup
+        
+            // Ép dọn rác trước khi bắt đầu để có điểm mốc RAM sạch nhất
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            long initialMemoryMB = GC.GetTotalMemory(true) / (1024 * 1024);
+            
+        
+            Console.WriteLine($"[Test 38] Bắt đầu Soak Test 5 phút. RAM ban đầu: {initialMemoryMB} MB");
+        
+            var duration = TimeSpan.FromMinutes(5);
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            var lastReportTime = stopwatch.Elapsed;
+        
+            // 2. Act: Vòng lặp bắn tin nhắn liên tục trong 5 phút
+            _ = Task.Run(async () =>
+            {
+                while (stopwatch.Elapsed < duration)
+                {
+                    // Bắn từng tin một, Server sẽ tự gom Batch ngầm
+                    _server.Publish("SoakTest", "VN-01", new Int32Value { Value = (int)sentCount });
+                    sentCount++;
+        
+                    // Nhường luồng mỗi 1000 tin để tránh CPU bị ngộp 100% gây đứt kết nối NATS
+                    if (sentCount % 1000 == 0)
+                    {
+                        await Task.Yield();
+                    }
+                }
+            });
+        
+            // Vòng lặp chính in Log báo cáo mỗi 30 giây để biết Test chưa bị treo
+            while (stopwatch.Elapsed < duration)
+            {
+                if (stopwatch.Elapsed - lastReportTime > TimeSpan.FromSeconds(30))
+                {
+                    long currentMem = GC.GetTotalMemory(false) / (1024 * 1024);
+                    Console.WriteLine(
+                        $"[Soak Test] Đang chạy... Đã gửi: {sentCount:N0} | Đã nhận: {Interlocked.Read(ref receivedCount):N0} | RAM: {currentMem} MB");
+                    lastReportTime = stopwatch.Elapsed;
+                }
+        
+                await Task.Delay(1000);
+            }
+        
+            // 3. Kết thúc thời gian bắn: Chờ Client tiêu hóa nốt dữ liệu còn đọng trên mạng
+            Console.WriteLine($"[Test 38] Đã hết 5 phút bắn đạn. Chờ Client xử lý nốt hàng tồn...");
+        
+            // Đợi tối đa 30 giây cho luồng nhận bắt kịp luồng gửi
+            var catchUpWaitTime = DateTime.UtcNow;
+            while (Interlocked.Read(ref receivedCount) < sentCount &&
+                   (DateTime.UtcNow - catchUpWaitTime).TotalSeconds < 30)
+            {
+                await Task.Delay(100);
+            }
+        
+            stopwatch.Stop();
+            _cts.Cancel(); // Dừng Game Loop
+        
+            // 4. Đo đạc lại RAM
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            long finalMemoryMB = GC.GetTotalMemory(true) / (1024 * 1024);
+            long memoryGrowth = finalMemoryMB - initialMemoryMB;
+        
+            // 5. Assert: KIỂM TOÁN DỮ LIỆU
+            long finalReceivedCount = Interlocked.Read(ref receivedCount);
+            long finalReceivedSum = Interlocked.Read(ref receivedSum);
+        
+            // Công thức tổng cấp số cộng: S = n * (n - 1) / 2 (Vì đếm từ 0)
+            long expectedSum = (sentCount - 1) * sentCount / 2;
+        
+            Console.WriteLine("=============================================");
+            Console.WriteLine($"[KẾT QUẢ SOAK TEST 5 PHÚT]");
+            Console.WriteLine($"- Gửi đi : {sentCount:N0} tin nhắn");
+            Console.WriteLine($"- Nhận về: {finalReceivedCount:N0} tin nhắn");
+            Console.WriteLine($"- Tăng trưởng RAM: {memoryGrowth} MB");
+            Console.WriteLine("=============================================");
+        
+            // Khẳng định 1: Không mất tin nhắn
+            Assert.That(finalReceivedCount, Is.EqualTo(sentCount), "CÓ SỰ CỐ MẤT TIN NHẮN (Packet Loss)!");
+        
+            // Khẳng định 2: Dữ liệu chính xác tuyệt đối, không trùng lặp (Dupe), không biến dạng
+            Assert.That(finalReceivedSum, Is.EqualTo(expectedSum),
+                "DỮ LIỆU BỊ SAI LỆCH! Có thể Deduplication hỏng hoặc Data bị corrupt.");
+        
+            // Khẳng định 3: Không rò rỉ bộ nhớ (Memory Leak)
+            // Trong C#, RAM dao động vài chục MB là bình thường do các buffer nội bộ của NATS.
+            // Nhưng nếu tăng hơn 100MB nghĩa là có rác không được giải phóng.
+            Assert.That(memoryGrowth, Is.LessThan(100), $"NGHI VẤN MEMORY LEAK! RAM tăng quá cao ({memoryGrowth} MB).");
+        }
 
         /// <summary>
         /// Kịch bản 39: Client -> Server RPC Reliability (20,000 Requests)
